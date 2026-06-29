@@ -1,0 +1,149 @@
+# chalet.yaml — Braid v0.1.0 (macOS only). Chalet 0.8.x schema.
+#
+# Deps live under libs/macos/ (copied from the ofWorks scaffold + ofxDawn):
+#   - libs/macos/lib/libwebgpu_dawn.a   (Dawn, monolithic static, exports wgpu*)
+#   - libs/macos/include/webgpu, /dawn  (Dawn headers)
+#   - libs/macos/include/RGFW.h         (windowing, single header)
+#   - libs/macos/include/{glm,fmt}      (math, formatting)
+name: braid
+version: 0.1.0
+
+abstracts:*:
+  language: C++
+  # RGFW + Dawn touch Cocoa; compile the implementation TU as Objective-C++.
+  language[toolchain:apple-llvm]: Objective-C++
+  settings:Cxx:
+    cppStandard: c++20
+    warningsPreset: extra
+    runtimeTypeInformation: true
+    threads: true
+    exceptions: true
+    compileOptions[:macos]:
+      - -mmacosx-version-min=11.0
+    linkerOptions[:macos]:
+      - -mmacosx-version-min=11.0
+    defines[:debug]:
+      - DEBUG
+    includeDirs:
+      - .
+      - libs/macos/include
+    appleFrameworks:
+      - Cocoa
+      - IOKit
+      - CoreVideo
+      - QuartzCore
+      - Metal
+      - IOSurface
+      - Foundation
+      - Accelerate
+    # Shared by every target: WebGPU (the heart) + fmt. The mango codec stack is
+    # NOT here — it belongs to the braid-image addon, linked only where image I/O
+    # is actually used (see the `image` target below).
+    staticLinks[:macos]:
+      - libs/macos/lib/libwebgpu_dawn.a
+      - libs/macos/lib/libfmt.a
+
+targets:
+  braid-core:
+    kind: staticLibrary
+    files:
+      include:
+        - braid.cpp        # compiles RGFW_IMPLEMENTATION + braid impl
+
+  # First addon: image file I/O. Defines Surface::load / Surface::save against the
+  # mango decode/encode stack. Only targets that need image I/O link this (and the
+  # mango archives at final link); pure feedback/shape sketches stay lean.
+  braid-image:
+    kind: staticLibrary
+    files:
+      include:
+        - braid_image.cpp
+
+  hello:
+    kind: executable
+    runWorkingDirectory: ${cwd}/bin
+    settings:Cxx:
+      staticLinks:
+        - braid-core
+    files:
+      include:
+        - examples/hello.cpp
+
+  sketch:
+    kind: executable
+    runWorkingDirectory: ${cwd}/bin
+    settings:Cxx:
+      staticLinks:
+        - braid-core
+    files:
+      include:
+        - examples/sketch.cpp
+
+  feedback:
+    kind: executable
+    runWorkingDirectory: ${cwd}/bin
+    settings:Cxx:
+      # Press S to save a frame → needs the braid-image addon + mango archives.
+      staticLinks:
+        - braid-core
+        - braid-image
+        - libs/macos/lib/libmango.a
+        - libs/macos/lib/libdeflate.a
+        - libs/macos/lib/libz.a
+        - libs/macos/lib/liblcms2.a
+        - libs/macos/lib/libzstd.a
+        - libs/macos/lib/libbz2_static.a
+        - libs/macos/lib/liblz4.a
+    files:
+      include:
+        - examples/feedback.cpp
+
+  feed:
+    kind: executable
+    runWorkingDirectory: ${cwd}/bin
+    settings:Cxx:
+      staticLinks:
+        - braid-core
+    files:
+      include:
+        - examples/feed.cpp
+
+  playground:
+    kind: executable
+    runWorkingDirectory: ${cwd}/bin
+    settings:Cxx:
+      staticLinks:
+        - braid-core
+    files:
+      include:
+        - examples/playground.cpp
+
+  cubes:
+    kind: executable
+    runWorkingDirectory: ${cwd}/bin
+    settings:Cxx:
+      staticLinks:
+        - braid-core
+    files:
+      include:
+        - examples/cubes.cpp
+
+  image:
+    kind: executable
+    runWorkingDirectory: ${cwd}/bin
+    settings:Cxx:
+      # This example uses image I/O, so it pulls in braid-image and the mango
+      # codec archives. The other examples link only braid-core and never see them.
+      staticLinks:
+        - braid-core
+        - braid-image
+        - libs/macos/lib/libmango.a
+        - libs/macos/lib/libdeflate.a
+        - libs/macos/lib/libz.a
+        - libs/macos/lib/liblcms2.a
+        - libs/macos/lib/libzstd.a
+        - libs/macos/lib/libbz2_static.a
+        - libs/macos/lib/liblz4.a
+    files:
+      include:
+        - examples/image.cpp
