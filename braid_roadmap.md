@@ -6,6 +6,36 @@ one primitive; algebra + self-feedback work; the ouroboros tunnel was captured t
 **Spirit:** a *fast* creative-coding microframework. Every milestone is a thing you can
 **see/run**, not a pile of plumbing. If a step doesn't end in a demo, it's too big.
 
+---
+
+## ⏭ Immediate (synthesized 2026-06-29)
+Distilled from a cross-read of every `.md` (review, unmapped-todos, dependency-concerns,
+geometry). The ordering is by **convergence** (where independent sessions agree) and
+**urgency** (which item gets more expensive every day). Several older docs predate the
+Surface/algebra/feedback/image work, which is now done — these are what's left and live.
+
+1. **`braid::Key` enum + keycode mapping at the pump** — *do first.* Cited by three docs
+   (dependency-concerns makes it the #1 RGFW mitigation; v0.1.1; unmapped #8 builds on it).
+   The only item whose cost **grows every session**: `KeyEvent.key` exposed the raw RGFW
+   code, and new sketches (`feed`, `feedback`, `image`) already compare raw chars. Own the
+   joint before more sketches weld to RGFW.  *(in progress)*
+2. **SketchApp batching** — the first performance wall. Ranked #1/#2 by two independent
+   review sessions; the stress case (`cubes.cpp`, hundreds of boxes each allocating a fresh
+   uniform buffer + bind group) is already in the repo. Per-frame dynamic vertex buffer +
+   a uniform ring bound at offsets, flushed on material/topology change.  *(in progress)*
+3. **Depth + always-lit default shader → solid `box`/`sphere`** — finishes v0.2.3's "sketch
+   tier complete". Two docs agree: `Surface` needs an optional depth attachment (correctness
+   blocker for filled 3D), then the default shader goes always-lit (geometry-roadmap option
+   3: one directional light + ambient; 2D shapes get `normal=(0,0,1)`), which unlocks solids.
+
+**Sweep while in the code (small, all cited):** wire `Settings::enableValidation` into device
+creation · fix `Channel` reentrancy (callbacks fire under `cbMtx_` during `pop()` → snapshot
+handlers, fire outside the lock) · clear the `braid.cpp` Metal `[VERIFY]` tag.
+**Foundational before the batching refactor (optional but cheap):** a non-GPU test harness
+(`Result`, `Channel`, `Timer`, `Mesh` generators, `remap`).
+
+---
+
 ### Implementation status (2026-06-29)
 - ✅ **v0.2.0 Surface pivot** — `Screen`→`Surface`; App draws into a persistent offscreen
   `Surface`, blitted to the swapchain at present. (`save()` later moved to braid-image, v0.3.0b.)

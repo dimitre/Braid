@@ -108,8 +108,33 @@ struct Vertex {
 // ---------------------------------------------------------------------------
 enum class MouseButton { Left, Right, Middle };
 
+// ---------------------------------------------------------------------------
+// Key — a Braid-owned keycode (the RGFW seam). Sketches compare against this,
+// never a raw RGFW value, so windowing stays a swappable joint. Printable keys
+// carry their ASCII value (Key::A == 'a', Key::Space == ' '); control/navigation
+// keys get Braid-owned values (256+) independent of RGFW's numbering.
+// For text-style input, prefer `KeyEvent::ch` (the printable char) over `key`.
+// ---------------------------------------------------------------------------
+enum class Key : int {
+    Unknown = 0,
+
+    Space = ' ', Apostrophe = '\'', Comma = ',', Minus = '-', Period = '.',
+    Slash = '/', Semicolon = ';', Equal = '=', LeftBracket = '[',
+    Backslash = '\\', RightBracket = ']', Backtick = '`',
+    Num0 = '0', Num1, Num2, Num3, Num4, Num5, Num6, Num7, Num8, Num9,  // contiguous
+    A = 'a', B, C, D, E, F, G, H, I, J, K, L, M,
+    N, O, P, Q, R, S, T, U, V, W, X, Y, Z,                              // contiguous
+
+    Escape = 256, Enter, Tab, Backspace, Delete, Insert, Menu,
+    Left, Right, Up, Down, Home, End, PageUp, PageDown,
+    CapsLock, NumLock,
+    Shift, Control, Alt, Super,  // either side, collapsed
+    F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12,
+};
+
 struct KeyEvent {
-    int key = 0;
+    Key key = Key::Unknown;  // Braid-owned keycode (named, RGFW-independent)
+    char ch = 0;             // printable character if any ('s', ' ', …), else 0
     bool pressed = false;
     bool repeat = false;
     bool shift = false, ctrl = false, alt = false, super = false;

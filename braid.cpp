@@ -952,6 +952,49 @@ static std::optional<MouseButton> mapButton(RGFW_mouseButton b) {
     }
 }
 
+// RGFW keycode -> braid::Key (the windowing seam: nothing above sees an RGFW value).
+// RGFW already gives printable keys their ASCII value, and braid::Key matches that,
+// so printables pass straight through; only control/navigation keys are remapped.
+static Key mapKey(RGFW_key v) {
+    switch (v) {
+        case RGFW_keyEscape:    return Key::Escape;
+        case RGFW_keyReturn:    return Key::Enter;     // == RGFW_keyEnter
+        case RGFW_keyTab:       return Key::Tab;
+        case RGFW_keyBackSpace: return Key::Backspace;
+        case RGFW_keyDelete:    return Key::Delete;
+        case RGFW_keyInsert:    return Key::Insert;
+        case RGFW_keyMenu:      return Key::Menu;
+        case RGFW_keyLeft:      return Key::Left;
+        case RGFW_keyRight:     return Key::Right;
+        case RGFW_keyUp:        return Key::Up;
+        case RGFW_keyDown:      return Key::Down;
+        case RGFW_keyHome:      return Key::Home;
+        case RGFW_keyEnd:       return Key::End;
+        case RGFW_keyPageUp:    return Key::PageUp;
+        case RGFW_keyPageDown:  return Key::PageDown;
+        case RGFW_keyCapsLock:  return Key::CapsLock;
+        case RGFW_keyNumLock:   return Key::NumLock;
+        case RGFW_keyShiftL:    case RGFW_keyShiftR:   return Key::Shift;
+        case RGFW_keyControlL:  case RGFW_keyControlR: return Key::Control;
+        case RGFW_keyAltL:      case RGFW_keyAltR:     return Key::Alt;
+        case RGFW_keySuperL:    case RGFW_keySuperR:   return Key::Super;
+        case RGFW_keyF1:  return Key::F1;   case RGFW_keyF2:  return Key::F2;
+        case RGFW_keyF3:  return Key::F3;   case RGFW_keyF4:  return Key::F4;
+        case RGFW_keyF5:  return Key::F5;   case RGFW_keyF6:  return Key::F6;
+        case RGFW_keyF7:  return Key::F7;   case RGFW_keyF8:  return Key::F8;
+        case RGFW_keyF9:  return Key::F9;   case RGFW_keyF10: return Key::F10;
+        case RGFW_keyF11: return Key::F11;  case RGFW_keyF12: return Key::F12;
+        default: break;
+    }
+    if (v >= 32 && v < 127) return static_cast<Key>(v);  // printable ASCII passthrough
+    return Key::Unknown;
+}
+
+// The printable character a key produces ('s', ' ', …), or 0 for control keys.
+static char printableChar(RGFW_key v) {
+    return (v >= 32 && v < 127) ? static_cast<char>(v) : 0;
+}
+
 // ===========================================================================
 // App
 // ===========================================================================
@@ -1090,18 +1133,24 @@ void App::pumpEvents() {
     while (RGFW_window_checkEvent(win, &ev)) {
         switch (ev.type) {
             case RGFW_keyPressed: {
-                KeyEvent e{static_cast<int>(ev.key.value), true, ev.key.repeat != 0};
+                KeyEvent e{};
+                e.key = mapKey(ev.key.value);
+                e.ch = printableChar(ev.key.value);
+                e.pressed = true;
+                e.repeat = ev.key.repeat != 0;
                 e.shift = (ev.key.mod & RGFW_modShift) != 0;
                 e.ctrl = (ev.key.mod & RGFW_modControl) != 0;
                 e.alt = (ev.key.mod & RGFW_modAlt) != 0;
                 e.super = (ev.key.mod & RGFW_modSuper) != 0;
-                if (e.super && ev.key.value == RGFW_keyQ) running_ = false;  // Cmd+Q quits
+                if (e.super && e.key == Key::Q) running_ = false;  // Cmd+Q quits
                 keyEvents.push(e);
                 keyPressed(e);
                 break;
             }
             case RGFW_keyReleased: {
-                KeyEvent e{static_cast<int>(ev.key.value), false, false};
+                KeyEvent e{};
+                e.key = mapKey(ev.key.value);
+                e.ch = printableChar(ev.key.value);
                 e.shift = (ev.key.mod & RGFW_modShift) != 0;
                 e.ctrl = (ev.key.mod & RGFW_modControl) != 0;
                 e.alt = (ev.key.mod & RGFW_modAlt) != 0;
