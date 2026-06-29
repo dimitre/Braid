@@ -312,6 +312,22 @@ unzipLibs() {
 	done
 }
 
+downloadRGFW() {
+	section "Downloading RGFW.h"
+	mkdir -p "${LIBS_FOLDER}/include"
+	local rgfw_url="https://raw.githubusercontent.com/ColleagueRiley/RGFW/refs/heads/main/RGFW.h"
+	local rgfw_path="${LIBS_FOLDER}/include/RGFW.h"
+
+	if command -v curl &>/dev/null; then
+		executa curl -L -o "${rgfw_path}" "${rgfw_url}"
+	elif command -v wget &>/dev/null; then
+		executa wget -O "${rgfw_path}" "${rgfw_url}"
+	else
+		echo "Error: no download tool available for RGFW.h"
+		exit 1
+	fi
+}
+
 # ============================================
 # Main Execution
 # ============================================
@@ -319,6 +335,7 @@ unzipLibs() {
 executa mkdir -p "${DOWNLOAD}"
 getlink
 unzipLibs
+downloadRGFW
 
 if [[ "$wipeDownloadsAfterInstall" == true && -d "${DOWNLOAD}" ]]; then
 	echo "Removing downloaded libraries"
