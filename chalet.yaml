@@ -27,6 +27,7 @@ abstracts:*:
     includeDirs:
       - .
       - libs/macos/include
+      - addons/braid-syntype
     appleFrameworks:
       - Cocoa
       - IOKit
@@ -58,6 +59,12 @@ targets:
     files:
       include:
         - braid_image.cpp
+
+  braid-syntype:
+    kind: staticLibrary
+    files:
+      include:
+        - addons/braid-syntype/braid_syntype.cpp
 
   hello:
     kind: executable
@@ -155,3 +162,36 @@ targets:
     files:
       include:
         - examples/image.cpp
+
+  syntype_basic:
+    kind: executable
+    runWorkingDirectory: ${cwd}/bin
+    settings:Cxx:
+      staticLinks:
+        - braid-core
+        - braid-syntype
+    files:
+      include:
+        - examples/syntype_basic.cpp
+
+  syntype_ui:
+    kind: executable
+    runWorkingDirectory: ${cwd}/bin
+    settings:Cxx:
+      staticLinks:
+        - braid-core
+        - braid-syntype
+    files:
+      include:
+        - examples/syntype_ui.cpp
+
+  syntype_audio:
+    kind: executable
+    runWorkingDirectory: ${cwd}/bin
+    settings:Cxx:
+      staticLinks:
+        - braid-core
+        - braid-syntype
+    files:
+      include:
+        - examples/syntype_audio.cpp

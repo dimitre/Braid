@@ -1359,17 +1359,25 @@ void SketchApp::beforeDraw() {
     transform_.current = glm::mat4(1.0f);
     transform_.stack.clear();
     bgRequested_ = false;  // omit background() to accumulate (feedback)
+    ensurePass();  // eagerly open so addons can draw into the active pass
 }
 
 void SketchApp::afterDraw() {
-    // background() with no geometry still needs to clear the surface.
-    if (bgRequested_ && batchCmds_.empty() && !passOpen_) ensurePass();
     emitBatch();  // upload the frame's geometry + uniforms, record the draws
     flush();      // end the pass
 }
 
-void SketchApp::background(float r, float g, float b, float a) { clearColor_ = {r, g, b, a}; bgRequested_ = true; }
-void SketchApp::background(glm::vec4 c) { clearColor_ = c; bgRequested_ = true; }
+void SketchApp::background(float r, float g, float b, float a) {
+    clearColor_ = {r, g, b, a};
+    bgRequested_ = true;
+    // Immediate clear so addons that draw into the active pass see a clean surface.
+    wgpu::CommandEncoder enc = device_.CreateCommandEncoder();
+    auto pass = surface().begin(enc, clearColor_);
+    surface().end(pass);
+    wgpu::CommandBuffer cmd = enc.Finish();
+    queue_.Submit(1, &cmd);
+}
+void SketchApp::background(glm::vec4 c) { background(c.r, c.g, c.b, c.a); }
 void SketchApp::fill(float r, float g, float b, float a) { state_.fill = {r, g, b, a}; state_.fillEnabled = true; }
 void SketchApp::fill(glm::vec4 c) { state_.fill = c; state_.fillEnabled = true; }
 void SketchApp::noFill() { state_.fillEnabled = false; }
@@ -1402,9 +1410,9 @@ void SketchApp::ortho(float l, float r, float b, float t, float nearZ, float far
 void SketchApp::ensurePass() {
     ensureReady();
     if (!passOpen_) {
-        currentPass_ = bgRequested_ ? surface().begin(encoder(), clearColor_)
-                                    : surface().beginLoad(encoder());
+        currentPass_ = surface().beginLoad(encoder());
         passOpen_ = true;
+        detail::ctx().currentPass = &currentPass_;
     }
 }
 
@@ -1611,6 +1619,7 @@ void SketchApp::flush() {
     if (passOpen_) {
         surface().end(currentPass_);
         passOpen_ = false;
+        detail::ctx().currentPass = nullptr;
     }
 }
 
