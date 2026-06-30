@@ -107,8 +107,3 @@ chalet buildrun feedback     # build + run the feedback demo
 - **Move-only GPU resources** — `std::move` them, store in `std::optional`, or `clone()` for an explicit GPU copy.
 - **Fallible functions return `Result<T>`** — expressive things never fail; resource things can.
 
----
-
-## License
-
-MIT
