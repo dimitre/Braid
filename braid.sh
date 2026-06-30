@@ -12,7 +12,7 @@ if [[ -n "$CHALET_PATH" ]]; then
     export PATH="$CHALET_PATH:$PATH"
 fi
 
-chalet buildrun feed
+chalet buildrun --only-required feed
 # cd ofGen
 # ./compile.sh
 
