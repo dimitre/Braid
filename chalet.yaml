@@ -25,9 +25,10 @@ abstracts:*:
     defines[:debug]:
       - DEBUG
     includeDirs:
-      - .
+      # - .
       - libs/macos/include
       - addons/braid-syntype
+      - core
     appleFrameworks:
       - Cocoa
       - IOKit
@@ -49,7 +50,7 @@ targets:
     kind: staticLibrary
     files:
       include:
-        - braid.cpp        # compiles RGFW_IMPLEMENTATION + braid impl
+        - core/braid.cpp # compiles RGFW_IMPLEMENTATION + braid impl
 
   # First addon: image file I/O. Defines Surface::load / Surface::save against the
   # mango decode/encode stack. Only targets that need image I/O link this (and the
@@ -58,7 +59,7 @@ targets:
     kind: staticLibrary
     files:
       include:
-        - braid_image.cpp
+        - core/braid_image.cpp
 
   braid-syntype:
     kind: staticLibrary
@@ -109,6 +110,8 @@ targets:
     kind: executable
     runWorkingDirectory: ${cwd}/bin
     settings:Cxx:
+      # includeDirs:
+      #   - core
       staticLinks:
         - braid-core
         - braid-image
