@@ -332,6 +332,16 @@ public:
     Surface& shift(float dx, float dy);  // pixels
     Surface& invert();               // rgb → 1-rgb (snake eating its tail)
     Surface& multiply(glm::vec4 c);  // per-channel gain / tint
+
+    // === Image-processing transforms ===
+    // Separable Gaussian blur. radius in pixels; H+V in one submit.
+    Surface& blur(float radius);
+    // Brightpass: keeps pixels whose luma exceeds `level` (soft knee). Output alpha=1
+    // so the result adds cleanly with +=. Default level=1.0 keeps HDR-only energy.
+    Surface& threshold(float level = 1.0f, float knee = 0.1f);
+    // bloom = clone → threshold → blur(4*passes px) → additive composite back.
+    Surface& bloom(float threshold = 1.0f, float intensity = 1.0f, int passes = 5);
+
     Surface& clear(glm::vec4 c = {0, 0, 0, 1});
 
     // === Self-feedback (the ouroboros) ===

@@ -1,5 +1,8 @@
 # Braid
 
+Imagined by Dimitre after working more than one decade with openFrameworks and collaborating in Core development.
+It derives a lot of ideas from ofWorks (openFrameworks fork).
+
 Braid is a **WebGPU creative-coding framework for macOS**. It is small, single-file-ish, and built on a single unifying idea: **a `Surface` is the only thing you draw into.**
 
 The screen is a Surface. An offscreen buffer is a Surface. An image is a Surface. They all compose with the same algebra — add, blend, zoom, rotate, shift, invert — so layers, feedback loops, and post-processing are all one vocabulary, not three different APIs.
@@ -106,4 +109,3 @@ chalet buildrun feedback     # build + run the feedback demo
 - **Custom WGSL clip space is `[0,1]`** (Metal/D3D/Vulkan style, not GL's `[-1,1]`). `glm` is already configured for this.
 - **Move-only GPU resources** — `std::move` them, store in `std::optional`, or `clone()` for an explicit GPU copy.
 - **Fallible functions return `Result<T>`** — expressive things never fail; resource things can.
-

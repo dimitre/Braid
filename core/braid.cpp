@@ -80,6 +80,20 @@ struct BlitUniforms {
     glm::vec2 _pad{0, 0};
 };
 
+struct BlurUniforms {
+    glm::vec2 texelSize;    // 1/w, 1/h
+    glm::vec2 dir;          // (1,0) H pass · (0,1) V pass
+    float radius = 4.0f;    // pixels
+    float _pad0 = 0;
+    glm::vec2 _pad1{};
+};
+
+struct ThresholdUniforms {
+    float level = 1.0f;
+    float knee  = 0.1f;
+    glm::vec2 _pad{};
+};
+
 static const char* kBlitWGSL = R"WGSL(
 struct Blit {
   uvScale : vec2<f32>, uvOffset : vec2<f32>, tint : vec4<f32>,
@@ -106,6 +120,73 @@ struct VO { @builtin(position) pos : vec4<f32>, @location(0) uv : vec2<f32> };
   var col = textureSample(tex, samp, uv);
   if (u.invert > 0.5) { col = vec4<f32>(vec3<f32>(1.0) - col.rgb, col.a); }
   return col * u.tint;
+}
+)WGSL";
+
+// Separable 1D Gaussian — run H then V for a full 2D blur.
+// Uniform layout matches the shared bgl_ (binding 0 = uniform, 1 = tex, 2 = sampler).
+static const char* kBlurWGSL = R"WGSL(
+struct Blur {
+  texelSize : vec2<f32>,
+  dir       : vec2<f32>,
+  radius    : f32,
+  _pad0     : f32,
+  _pad1     : vec2<f32>,
+};
+@group(0) @binding(0) var<uniform> u : Blur;
+@group(0) @binding(1) var tex : texture_2d<f32>;
+@group(0) @binding(2) var samp : sampler;
+struct VO { @builtin(position) pos : vec4<f32>, @location(0) uv : vec2<f32> };
+@vertex fn vs(@builtin(vertex_index) i : u32) -> VO {
+  var ps = array<vec2<f32>, 3>(vec2<f32>(-1.0,-1.0), vec2<f32>(3.0,-1.0), vec2<f32>(-1.0,3.0));
+  let p = ps[i];
+  var o : VO;
+  o.pos = vec4<f32>(p, 0.0, 1.0);
+  o.uv  = vec2<f32>((p.x + 1.0) * 0.5, 1.0 - (p.y + 1.0) * 0.5);
+  return o;
+}
+@fragment fn fs(in : VO) -> @location(0) vec4<f32> {
+  let sigma = max(u.radius / 3.0, 0.5);
+  let taps = min(i32(ceil(u.radius)) + 1, 32);
+  var col = vec4<f32>(0.0);
+  var wsum = 0.0;
+  for (var i = -taps; i <= taps; i++) {
+    let fi = f32(i);
+    let w = exp(-fi * fi / (2.0 * sigma * sigma));
+    // textureSampleLevel (lod=0) is valid outside uniform control flow;
+    // textureSample would require uniform CF which dynamic loops don't guarantee.
+    col  += textureSampleLevel(tex, samp, in.uv + u.dir * u.texelSize * fi, 0.0) * w;
+    wsum += w;
+  }
+  return col / wsum;
+}
+)WGSL";
+
+// Brightpass filter — keeps pixels whose luma exceeds `level`.
+// Output alpha=1 so additive blend (+=) adds full RGB energy.
+static const char* kThresholdWGSL = R"WGSL(
+struct Thresh {
+  level : f32,
+  knee  : f32,
+  _pad  : vec2<f32>,
+};
+@group(0) @binding(0) var<uniform> u : Thresh;
+@group(0) @binding(1) var tex : texture_2d<f32>;
+@group(0) @binding(2) var samp : sampler;
+struct VO { @builtin(position) pos : vec4<f32>, @location(0) uv : vec2<f32> };
+@vertex fn vs(@builtin(vertex_index) i : u32) -> VO {
+  var ps = array<vec2<f32>, 3>(vec2<f32>(-1.0,-1.0), vec2<f32>(3.0,-1.0), vec2<f32>(-1.0,3.0));
+  let p = ps[i];
+  var o : VO;
+  o.pos = vec4<f32>(p, 0.0, 1.0);
+  o.uv  = vec2<f32>((p.x + 1.0) * 0.5, 1.0 - (p.y + 1.0) * 0.5);
+  return o;
+}
+@fragment fn fs(in : VO) -> @location(0) vec4<f32> {
+  let col  = textureSample(tex, samp, in.uv);
+  let luma = dot(col.rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
+  let t    = clamp((luma - u.level) / max(u.knee, 0.0001), 0.0, 1.0);
+  return vec4<f32>(col.rgb * t, 1.0);
 }
 )WGSL";
 
@@ -170,6 +251,20 @@ public:
         qsmd.nextInChain = &qsrc;
         qsmd.label = "braid-quad";
         quadModule_ = device_.CreateShaderModule(&qsmd);
+
+        wgpu::ShaderSourceWGSL blursrc{};
+        blursrc.code = kBlurWGSL;
+        wgpu::ShaderModuleDescriptor blursmd{};
+        blursmd.nextInChain = &blursrc;
+        blursmd.label = "braid-blur";
+        blurModule_ = device_.CreateShaderModule(&blursmd);
+
+        wgpu::ShaderSourceWGSL thrsrc{};
+        thrsrc.code = kThresholdWGSL;
+        wgpu::ShaderModuleDescriptor thrsmd{};
+        thrsmd.nextInChain = &thrsrc;
+        thrsmd.label = "braid-threshold";
+        thresholdModule_ = device_.CreateShaderModule(&thrsmd);
 
         wgpu::SamplerDescriptor sd{};
         sd.magFilter = wgpu::FilterMode::Linear;
@@ -291,6 +386,71 @@ public:
         pass.End();
     }
 
+    // One separable blur pass along `dir` (1,0)=H or (0,1)=V. Always overwrites dest.
+    void blurPass(wgpu::CommandEncoder& enc, wgpu::TextureView dest, wgpu::TextureFormat destFormat,
+                  wgpu::TextureView src, glm::vec2 texelSize, glm::vec2 dir, float radius) {
+        BlurUniforms u{};
+        u.texelSize = texelSize;
+        u.dir = dir;
+        u.radius = radius;
+        wgpu::BufferDescriptor bd{};
+        bd.size = sizeof(BlurUniforms);
+        bd.usage = wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst;
+        wgpu::Buffer ub = device_.CreateBuffer(&bd);
+        device_.GetQueue().WriteBuffer(ub, 0, &u, sizeof(u));
+
+        std::array<wgpu::BindGroupEntry, 3> be{};
+        be[0].binding = 0; be[0].buffer = ub; be[0].size = sizeof(BlurUniforms);
+        be[1].binding = 1; be[1].textureView = src;
+        be[2].binding = 2; be[2].sampler = sampler_;
+        wgpu::BindGroupDescriptor bgd{};
+        bgd.layout = bgl_; bgd.entryCount = be.size(); bgd.entries = be.data();
+        wgpu::BindGroup bg = device_.CreateBindGroup(&bgd);
+
+        wgpu::RenderPassColorAttachment att{};
+        att.view = dest; att.loadOp = wgpu::LoadOp::Clear; att.storeOp = wgpu::StoreOp::Store;
+        att.clearValue = {0, 0, 0, 1};
+        wgpu::RenderPassDescriptor rpd{};
+        rpd.colorAttachmentCount = 1; rpd.colorAttachments = &att;
+
+        wgpu::RenderPassEncoder pass = enc.BeginRenderPass(&rpd);
+        pass.SetPipeline(blurPipelineFor(destFormat));
+        pass.SetBindGroup(0, bg);
+        pass.Draw(3);
+        pass.End();
+    }
+
+    void thresholdPass(wgpu::CommandEncoder& enc, wgpu::TextureView dest, wgpu::TextureFormat destFormat,
+                       wgpu::TextureView src, float level, float knee) {
+        ThresholdUniforms u{};
+        u.level = level; u.knee = knee;
+        wgpu::BufferDescriptor bd{};
+        bd.size = sizeof(ThresholdUniforms);
+        bd.usage = wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst;
+        wgpu::Buffer ub = device_.CreateBuffer(&bd);
+        device_.GetQueue().WriteBuffer(ub, 0, &u, sizeof(u));
+
+        std::array<wgpu::BindGroupEntry, 3> be{};
+        be[0].binding = 0; be[0].buffer = ub; be[0].size = sizeof(ThresholdUniforms);
+        be[1].binding = 1; be[1].textureView = src;
+        be[2].binding = 2; be[2].sampler = sampler_;
+        wgpu::BindGroupDescriptor bgd{};
+        bgd.layout = bgl_; bgd.entryCount = be.size(); bgd.entries = be.data();
+        wgpu::BindGroup bg = device_.CreateBindGroup(&bgd);
+
+        wgpu::RenderPassColorAttachment att{};
+        att.view = dest; att.loadOp = wgpu::LoadOp::Clear; att.storeOp = wgpu::StoreOp::Store;
+        att.clearValue = {0, 0, 0, 0};
+        wgpu::RenderPassDescriptor rpd{};
+        rpd.colorAttachmentCount = 1; rpd.colorAttachments = &att;
+
+        wgpu::RenderPassEncoder pass = enc.BeginRenderPass(&rpd);
+        pass.SetPipeline(thresholdPipelineFor(destFormat));
+        pass.SetBindGroup(0, bg);
+        pass.Draw(3);
+        pass.End();
+    }
+
 private:
     wgpu::RenderPipeline pipelineFor(wgpu::TextureFormat fmt, const wgpu::BlendState& blend) {
         for (auto& [f, b, p] : cache_)
@@ -344,9 +504,49 @@ private:
         return p;
     }
 
+    wgpu::RenderPipeline blurPipelineFor(wgpu::TextureFormat fmt) {
+        for (auto& [f, p] : blurCache_) if (f == fmt) return p;
+        wgpu::ColorTargetState target{};
+        target.format = fmt;
+        target.writeMask = wgpu::ColorWriteMask::All;
+        wgpu::FragmentState frag{};
+        frag.module = blurModule_; frag.entryPoint = "fs";
+        frag.targetCount = 1; frag.targets = &target;
+        wgpu::RenderPipelineDescriptor rpd{};
+        rpd.layout = pl_;
+        rpd.vertex.module = blurModule_; rpd.vertex.entryPoint = "vs";
+        rpd.primitive.topology = wgpu::PrimitiveTopology::TriangleList;
+        rpd.fragment = &frag;
+        rpd.multisample.count = 1; rpd.multisample.mask = 0xFFFFFFFF;
+        wgpu::RenderPipeline p = device_.CreateRenderPipeline(&rpd);
+        blurCache_.push_back({fmt, p});
+        return p;
+    }
+
+    wgpu::RenderPipeline thresholdPipelineFor(wgpu::TextureFormat fmt) {
+        for (auto& [f, p] : thresholdCache_) if (f == fmt) return p;
+        wgpu::ColorTargetState target{};
+        target.format = fmt;
+        target.writeMask = wgpu::ColorWriteMask::All;
+        wgpu::FragmentState frag{};
+        frag.module = thresholdModule_; frag.entryPoint = "fs";
+        frag.targetCount = 1; frag.targets = &target;
+        wgpu::RenderPipelineDescriptor rpd{};
+        rpd.layout = pl_;
+        rpd.vertex.module = thresholdModule_; rpd.vertex.entryPoint = "vs";
+        rpd.primitive.topology = wgpu::PrimitiveTopology::TriangleList;
+        rpd.fragment = &frag;
+        rpd.multisample.count = 1; rpd.multisample.mask = 0xFFFFFFFF;
+        wgpu::RenderPipeline p = device_.CreateRenderPipeline(&rpd);
+        thresholdCache_.push_back({fmt, p});
+        return p;
+    }
+
     wgpu::Device device_;
     wgpu::ShaderModule module_;
     wgpu::ShaderModule quadModule_;
+    wgpu::ShaderModule blurModule_;
+    wgpu::ShaderModule thresholdModule_;
     wgpu::Sampler sampler_;
     wgpu::BindGroupLayout bgl_;
     wgpu::PipelineLayout pl_;
@@ -354,6 +554,8 @@ private:
     int ringIndex_ = 0;
     std::vector<std::tuple<wgpu::TextureFormat, const void*, wgpu::RenderPipeline>> cache_;
     std::vector<std::tuple<wgpu::TextureFormat, const void*, wgpu::RenderPipeline>> quadCache_;
+    std::vector<std::pair<wgpu::TextureFormat, wgpu::RenderPipeline>> blurCache_;
+    std::vector<std::pair<wgpu::TextureFormat, wgpu::RenderPipeline>> thresholdCache_;
     bool ready_ = false;
 };
 
@@ -561,6 +763,51 @@ Surface& Surface::shift(float dx, float dy) {
 }
 Surface& Surface::invert() { selfTransform({1, 1}, {0, 0}, 0, {1, 1, 1, 1}, true); return *this; }
 Surface& Surface::multiply(glm::vec4 c) { selfTransform({1, 1}, {0, 0}, 0, c, false); return *this; }
+
+// Separable blur: H pass (main→scratch), then V pass (scratch→main).
+// Two separate submits guarantee the GPU barrier between the passes.
+Surface& Surface::blur(float radius) {
+    if (swapchain_ || !view_ || radius <= 0) return *this;
+    ensureScratch();
+    glm::vec2 ts{1.0f / width_, 1.0f / height_};
+    {
+        wgpu::CommandEncoder enc = device_.CreateCommandEncoder();
+        detail::compositor().blurPass(enc, scratchView_, format_, view_, ts, {1, 0}, radius);
+        wgpu::CommandBuffer cmd = enc.Finish();
+        device_.GetQueue().Submit(1, &cmd);
+    }
+    {
+        wgpu::CommandEncoder enc = device_.CreateCommandEncoder();
+        detail::compositor().blurPass(enc, view_, format_, scratchView_, ts, {0, 1}, radius);
+        wgpu::CommandBuffer cmd = enc.Finish();
+        device_.GetQueue().Submit(1, &cmd);
+    }
+    return *this;
+}
+
+Surface& Surface::threshold(float level, float knee) {
+    if (swapchain_ || !view_) return *this;
+    ensureScratch();
+    wgpu::CommandEncoder enc = device_.CreateCommandEncoder();
+    detail::compositor().thresholdPass(enc, scratchView_, format_, view_, level, knee);
+    wgpu::CommandBuffer cmd = enc.Finish();
+    device_.GetQueue().Submit(1, &cmd);
+    swapScratch();
+    return *this;
+}
+
+// bloom = clone → threshold → blur → additive-composite back.
+// passes scales the blur radius (passes=5 → ~20px). Total: three render submits + one clone.
+Surface& Surface::bloom(float threshold_level, float intensity, int passes) {
+    auto glowR = clone();
+    if (!glowR) return *this;
+    auto& glow = *glowR;
+    glow.threshold(threshold_level);
+    glow.blur(4.0f * float(passes));
+    if (intensity != 1.0f) glow.multiply({intensity, intensity, intensity, 1.0f});
+    *this += glow;
+    return *this;
+}
 
 Surface& Surface::clear(glm::vec4 c) {
     if (!view_) return *this;
@@ -1359,7 +1606,10 @@ void SketchApp::beforeDraw() {
     transform_.current = glm::mat4(1.0f);
     transform_.stack.clear();
     bgRequested_ = false;  // omit background() to accumulate (feedback)
-    ensurePass();  // eagerly open so addons can draw into the active pass
+    // Pass opens lazily (see ensurePass()/pass()) on first actual draw, after any
+    // feedback()/zoom()/rotate()/blur()/multiply()/invert() the user calls in draw()
+    // — those ping-pong the Surface's texture, so opening the pass before they run
+    // would bind it to the wrong (about-to-be-swapped-out) buffer.
 }
 
 void SketchApp::afterDraw() {

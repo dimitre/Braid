@@ -10,7 +10,10 @@ public:
     using braid::SketchApp::SketchApp;
 
     void draw() override {
-        background(0.08f, 0.09f, 0.11f);  // clears (omit it to accumulate)
+        // background(0.08f, 0.09f, 0.11f);  // clears (omit it to accumulate)
+        // background(0.08f, 0.09f, 0.11f, 0.01f);  // clears (omit it to accumulate)
+        surface().feedback(0.97f, [](braid::Surface& s) {
+        });
 
         float t = elapsedTime();
         // a row of pulsing circles
@@ -29,6 +32,7 @@ public:
         fill(1.0f, 0.7f, 0.2f);
         rect(-30, -30, 60, 60);
         popMatrix();
+
 
     }
 };

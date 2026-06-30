@@ -15,6 +15,8 @@ public:
             s.zoom(1.03f);
             s.rotate(0.0016f);
             s.invert();
+            // s.blur(3.0f);
+            // s.bloom();
         });
 
         // --- new input on top ---
