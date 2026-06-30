@@ -1112,6 +1112,9 @@ Result<void> App::initWebGPU() {
     swapSurface_.emplace(surface_, settings_.width, settings_.height, settings_.format);
     mainSurface_.emplace(device_, settings_.width, settings_.height,
                          wgpu::TextureFormat::RGBA16Float);
+    // WebGPU zero-initializes textures (alpha=0). Clear to opaque black so that
+    // Surface algebra (invert, pasteSelf) and save() always see alpha=1 from frame 1.
+    mainSurface_->clear({0, 0, 0, 1});
     return Result<void>::success();
 }
 

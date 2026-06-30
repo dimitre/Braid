@@ -104,6 +104,14 @@ targets:
     settings:Cxx:
       staticLinks:
         - braid-core
+        - braid-image
+        - libs/macos/lib/libmango.a
+        - libs/macos/lib/libdeflate.a
+        - libs/macos/lib/libz.a
+        - libs/macos/lib/liblcms2.a
+        - libs/macos/lib/libzstd.a
+        - libs/macos/lib/libbz2_static.a
+        - libs/macos/lib/liblz4.a
     files:
       include:
         - examples/feed.cpp
