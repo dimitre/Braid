@@ -1309,43 +1309,45 @@ struct SketchUniforms {
     glm::vec4 tint;
 };
 
-// A fresh uniform buffer + bind group per draw. SketchApp issues hundreds of
-// draws into one command buffer, so they cannot share Shader's 3-slot ring
-// (which is for one-uniform-per-frame); each needs its own buffer, kept alive by
-// the bind group until the frame is submitted.
-static wgpu::BindGroup freshUniform(wgpu::Device dev, wgpu::RenderPipeline pipeline,
-                                    const void* data, size_t size) {
-    wgpu::BufferDescriptor bd{};
-    bd.size = size;
-    bd.usage = wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst;
-    wgpu::Buffer ub = dev.CreateBuffer(&bd);
-    dev.GetQueue().WriteBuffer(ub, 0, data, size);
-    wgpu::BindGroupEntry e{};
-    e.binding = 0;
-    e.buffer = ub;
-    e.size = size;
-    wgpu::BindGroupDescriptor bgd{};
-    bgd.layout = pipeline.GetBindGroupLayout(0);
-    bgd.entryCount = 1;
-    bgd.entries = &e;
-    return dev.CreateBindGroup(&bgd);
-}
+// Dynamic-offset alignment: 256 is the spec's max for minUniformBufferOffsetAlignment,
+// so a 256-byte stride is valid on every device without querying limits.
+static constexpr uint64_t kUniformStride = 256;
 
 SketchApp::SketchApp() : SketchApp(Settings{}) {}
 SketchApp::SketchApp(const Settings& settings) : App(settings) {}
 
-// Lazy init so a user-overridden setup() never clashes with ours.
+// Lazy init so a user-overridden setup() never clashes with ours. Builds the
+// default shader module + an explicit pipeline layout whose uniform binding uses
+// a dynamic offset (Shader's auto-layout can't, hence the dedicated pipeline).
 void SketchApp::ensureReady() {
     if (ready_) return;
     proj_ = glm::ortho(0.0f, static_cast<float>(settings_.width),
                        static_cast<float>(settings_.height), 0.0f, -1.0f, 1.0f);
     view_ = glm::mat4(1.0f);
-    Shader::LoadOptions opts{};
-    opts.wgsl = kDefaultWGSL;
-    opts.label = "braid-default";
-    if (auto r = Shader::load(device_, opts)) defaultShader_ = std::move(*r);
-    else fmt::print(stderr, "[braid] default shader failed: {}\n", r.error);
-    scratch_.emplace(device_);
+
+    wgpu::ShaderSourceWGSL src{};
+    src.code = kDefaultWGSL;
+    wgpu::ShaderModuleDescriptor smd{};
+    smd.nextInChain = &src;
+    smd.label = "braid-default";
+    sketchModule_ = device_.CreateShaderModule(&smd);
+
+    wgpu::BindGroupLayoutEntry e{};
+    e.binding = 0;
+    e.visibility = wgpu::ShaderStage::Vertex | wgpu::ShaderStage::Fragment;
+    e.buffer.type = wgpu::BufferBindingType::Uniform;
+    e.buffer.hasDynamicOffset = true;
+    e.buffer.minBindingSize = sizeof(SketchUniforms);
+    wgpu::BindGroupLayoutDescriptor bgld{};
+    bgld.entryCount = 1;
+    bgld.entries = &e;
+    sketchBGL_ = device_.CreateBindGroupLayout(&bgld);
+
+    wgpu::PipelineLayoutDescriptor pld{};
+    pld.bindGroupLayoutCount = 1;
+    pld.bindGroupLayouts = &sketchBGL_;
+    sketchPL_ = device_.CreatePipelineLayout(&pld);
+
     ready_ = true;
 }
 
@@ -1357,9 +1359,10 @@ void SketchApp::beforeDraw() {
 }
 
 void SketchApp::afterDraw() {
-    // If background() was requested but nothing opened a pass, clear anyway.
-    if (bgRequested_ && !passOpen_) ensurePass();
-    flush();
+    // background() with no geometry still needs to clear the surface.
+    if (bgRequested_ && batchCmds_.empty() && !passOpen_) ensurePass();
+    emitBatch();  // upload the frame's geometry + uniforms, record the draws
+    flush();      // end the pass
 }
 
 void SketchApp::background(float r, float g, float b, float a) { clearColor_ = {r, g, b, a}; bgRequested_ = true; }
@@ -1402,36 +1405,120 @@ void SketchApp::ensurePass() {
     }
 }
 
+// Append-only: record geometry + the current MVP/fill; the GPU work happens once
+// in emitBatch(). firstVertex indexes into the shared per-frame vertex buffer.
 void SketchApp::drawTris(std::span<const Vertex> verts) {
-    if (!state_.fillEnabled || verts.empty() || !defaultShader_.isValid()) return;
-    ensurePass();
-
-    // Tint with the current fill color; geometry carries white vertex color.
-    std::vector<Vertex> tinted(verts.begin(), verts.end());
-    if (auto r = scratch_->setVertices(tinted); !r) return;
-
-    auto pipeline = defaultShader_.getPipeline(Mesh::vertexLayout(), surface().format(),
-                                               Blend::Alpha);
-    SketchUniforms u{proj_ * view_ * transform_.current, state_.fill};
-    auto bg = freshUniform(device_, pipeline, &u, sizeof(u));
-
-    currentPass_.SetPipeline(pipeline);
-    currentPass_.SetBindGroup(0, bg);
-    scratch_->draw(currentPass_);
+    if (!state_.fillEnabled || verts.empty()) return;
+    DrawCmd c;
+    c.firstVertex = static_cast<uint32_t>(batchVerts_.size());
+    c.vertexCount = static_cast<uint32_t>(verts.size());
+    c.mvp = proj_ * view_ * transform_.current;
+    c.tint = state_.fill;
+    c.lines = false;
+    batchVerts_.insert(batchVerts_.end(), verts.begin(), verts.end());
+    batchCmds_.push_back(c);
 }
 
 void SketchApp::drawLines(std::span<const Vertex> verts) {
-    if (verts.empty() || !defaultShader_.isValid()) return;
+    if (verts.empty()) return;
+    DrawCmd c;
+    c.firstVertex = static_cast<uint32_t>(batchVerts_.size());
+    c.vertexCount = static_cast<uint32_t>(verts.size());
+    c.mvp = proj_ * view_ * transform_.current;
+    c.tint = state_.fill;
+    c.lines = true;
+    batchVerts_.insert(batchVerts_.end(), verts.begin(), verts.end());
+    batchCmds_.push_back(c);
+}
+
+wgpu::RenderPipeline SketchApp::sketchPipeline(wgpu::TextureFormat fmt, bool lines) {
+    for (auto& sp : sketchPipelines_)
+        if (sp.format == fmt && sp.lines == lines) return sp.pipeline;
+
+    wgpu::ColorTargetState target{};
+    target.format = fmt;
+    target.blend = &Blend::Alpha;
+    target.writeMask = wgpu::ColorWriteMask::All;
+    wgpu::FragmentState frag{};
+    frag.module = sketchModule_;
+    frag.entryPoint = "fs";
+    frag.targetCount = 1;
+    frag.targets = &target;
+    wgpu::VertexBufferLayout vbl = Mesh::vertexLayout();
+    wgpu::RenderPipelineDescriptor desc{};
+    desc.layout = sketchPL_;
+    desc.vertex.module = sketchModule_;
+    desc.vertex.entryPoint = "vs";
+    desc.vertex.bufferCount = 1;
+    desc.vertex.buffers = &vbl;
+    desc.fragment = &frag;
+    desc.primitive.topology =
+        lines ? wgpu::PrimitiveTopology::LineList : wgpu::PrimitiveTopology::TriangleList;
+    desc.multisample.count = 1;
+    desc.multisample.mask = 0xFFFFFFFF;
+    wgpu::RenderPipeline p = device_.CreateRenderPipeline(&desc);
+    sketchPipelines_.push_back({fmt, lines, p});
+    return p;
+}
+
+void SketchApp::emitBatch() {
+    if (batchCmds_.empty()) return;
+    ensureReady();
+
+    // 1) Grow + upload the vertex buffer (one write for the whole frame).
+    const size_t needVerts = batchVerts_.size();
+    if (needVerts > vboCapacity_) {
+        vboCapacity_ = std::max<size_t>(needVerts, vboCapacity_ ? vboCapacity_ * 2 : 4096);
+        wgpu::BufferDescriptor bd{};
+        bd.size = vboCapacity_ * sizeof(Vertex);
+        bd.usage = wgpu::BufferUsage::Vertex | wgpu::BufferUsage::CopyDst;
+        vbo_ = device_.CreateBuffer(&bd);
+    }
+    device_.GetQueue().WriteBuffer(vbo_, 0, batchVerts_.data(), needVerts * sizeof(Vertex));
+
+    // 2) Grow + upload the uniform pool — one 256-aligned slot per draw. Growing
+    //    re-creates the single bind group bound over the whole pool (offset = dynamic).
+    const size_t needSlots = batchCmds_.size();
+    if (needSlots > uboCapacity_) {
+        uboCapacity_ = std::max<size_t>(needSlots, uboCapacity_ ? uboCapacity_ * 2 : 256);
+        wgpu::BufferDescriptor bd{};
+        bd.size = uboCapacity_ * kUniformStride;
+        bd.usage = wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst;
+        ubo_ = device_.CreateBuffer(&bd);
+        wgpu::BindGroupEntry e{};
+        e.binding = 0;
+        e.buffer = ubo_;
+        e.offset = 0;
+        e.size = sizeof(SketchUniforms);  // the dynamic window, not the whole pool
+        wgpu::BindGroupDescriptor bgd{};
+        bgd.layout = sketchBGL_;
+        bgd.entryCount = 1;
+        bgd.entries = &e;
+        uboBindGroup_ = device_.CreateBindGroup(&bgd);
+    }
+    std::vector<uint8_t> staging(needSlots * kUniformStride, 0);
+    for (size_t i = 0; i < needSlots; ++i) {
+        SketchUniforms u{batchCmds_[i].mvp, batchCmds_[i].tint};
+        std::memcpy(staging.data() + i * kUniformStride, &u, sizeof(u));
+    }
+    device_.GetQueue().WriteBuffer(ubo_, 0, staging.data(), staging.size());
+
+    // 3) Replay: one pass, pipeline switched only when topology changes.
     ensurePass();
-    std::vector<Vertex> v(verts.begin(), verts.end());
-    if (auto r = scratch_->setVertices(v); !r) return;
-    auto pipeline = defaultShader_.getPipeline(Mesh::vertexLayout(), surface().format(),
-                                               Blend::Alpha, wgpu::PrimitiveTopology::LineList);
-    SketchUniforms u{proj_ * view_ * transform_.current, state_.fill};
-    auto bg = freshUniform(device_, pipeline, &u, sizeof(u));
-    currentPass_.SetPipeline(pipeline);
-    currentPass_.SetBindGroup(0, bg);
-    scratch_->draw(currentPass_);
+    const wgpu::TextureFormat fmt = surface().format();
+    WGPURenderPipeline cur = nullptr;
+    for (size_t i = 0; i < needSlots; ++i) {
+        const DrawCmd& c = batchCmds_[i];
+        wgpu::RenderPipeline p = sketchPipeline(fmt, c.lines);
+        if (p.Get() != cur) { currentPass_.SetPipeline(p); cur = p.Get(); }
+        currentPass_.SetVertexBuffer(0, vbo_, c.firstVertex * sizeof(Vertex),
+                                     c.vertexCount * sizeof(Vertex));
+        uint32_t off = static_cast<uint32_t>(i * kUniformStride);
+        currentPass_.SetBindGroup(0, uboBindGroup_, 1, &off);
+        currentPass_.Draw(c.vertexCount);
+    }
+    batchVerts_.clear();
+    batchCmds_.clear();
 }
 
 void SketchApp::box(float size) { box(size, size, size); }
@@ -1515,7 +1602,7 @@ void SketchApp::point(float x, float y) {
     state_.fill = save;
 }
 
-wgpu::RenderPassEncoder& SketchApp::pass() { ensurePass(); return currentPass_; }
+wgpu::RenderPassEncoder& SketchApp::pass() { emitBatch(); ensurePass(); return currentPass_; }
 
 void SketchApp::flush() {
     if (passOpen_) {

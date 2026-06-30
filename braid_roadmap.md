@@ -19,10 +19,13 @@ Surface/algebra/feedback/image work, which is now done — these are what's left
    The only item whose cost **grows every session**: `KeyEvent.key` exposed the raw RGFW
    code, and new sketches (`feed`, `feedback`, `image`) already compare raw chars. Own the
    joint before more sketches weld to RGFW.  *(in progress)*
-2. **SketchApp batching** — the first performance wall. Ranked #1/#2 by two independent
-   review sessions; the stress case (`cubes.cpp`, hundreds of boxes each allocating a fresh
-   uniform buffer + bind group) is already in the repo. Per-frame dynamic vertex buffer +
-   a uniform ring bound at offsets, flushed on material/topology change.  *(in progress)*
+2. **SketchApp batching** — ✅ done 06-29. Primitives now defer: each appends geometry +
+   a `DrawCmd`; at flush the frame uploads in **two writes** (one growing vertex buffer +
+   one 256-aligned uniform pool addressed by **dynamic offset**, single bind group) and
+   replays as draws, switching pipeline only on topology change. A frame of N shapes
+   allocates **nothing** in steady state (was: a buffer + bind group *per primitive*).
+   Needed a dedicated SketchApp pipeline (explicit layout w/ `hasDynamicOffset`, since
+   `Shader::getPipeline` uses auto-layout). `cubes.cpp` (~400 boxes/frame) runs clean.
 3. **Depth + always-lit default shader → solid `box`/`sphere`** — finishes v0.2.3's "sketch
    tier complete". Two docs agree: `Surface` needs an optional depth attachment (correctness
    blocker for filled 3D), then the default shader goes always-lit (geometry-roadmap option
@@ -48,8 +51,8 @@ handlers, fire outside the lock) · clear the `braid.cpp` Metal `[VERIFY]` tag.
   through Surface. **Microframework port done** = `examples/cubes.cpp` (nested rotating
   wireframe lattice). Fixed: per-primitive uniform collision (hundreds of draws were sharing
   the 3-slot ring → now a fresh uniform buffer per primitive).
-  **remaining:** real stroke outlines, **batching** (per-primitive vertex+uniform churn, review #4),
-  `image()`, solid `box`/`sphere` fill.
+  Batching done 06-29 (deferred draws → shared vertex buffer + dynamic-offset uniform pool).
+  **remaining:** real stroke outlines, `image()` placed-quad, solid `box`/`sphere` fill (needs depth).
 - Examples: `hello`, `sketch`, `feedback`, `playground`, `cubes` — all build+run, all in `.zed`.
   Cmd+Shift+R runs playground; Cmd+Q/Esc quit; fps-in-title helper.
 
@@ -141,12 +144,15 @@ Window already shows and runs via `chalet run` — visibility is **not** a probl
 So this milestone is minor polish, done whenever.
 - [ ] 2–3 tiny examples (clear color, spinning mesh, mouse-follow)
 - [ ] Resolve RGFW drag-and-drop crash (drop the flag cleanly, or patch/report upstream)
-- [ ] **`braid::Key` enum + keycode mapping at the pump** — `KeyEvent.key` currently exposes
-      the raw `ev.key.value` (braid.cpp:990), so sketches must compare against `RGFW_*`. Map
-      to a Braid enum so RGFW stays a swappable joint (cheap now, expensive once sketches
-      compare raw codes) *(review 06-29)*
+- [x] **`braid::Key` enum + keycode mapping at the pump** — done 06-29. `KeyEvent.key` is now
+      `braid::Key` (Braid-owned; printables == ASCII, control keys 256+) mapped from RGFW in
+      `mapKey()` at the pump; added `KeyEvent.ch` (printable char) for `if (e.ch=='s')` ergonomics.
+      No sketch sees an RGFW code → windowing stays a swappable joint. Examples migrated.
 - [ ] **Harden the Metal surface** — clear the `braid.cpp:909 [VERIFY]` tag once confirmed
       across resize + HiDPI; it's the platform code with the least margin *(review 06-29)*
+- [ ] **HiDPI / content-scale** — verify `RGFW` reports framebuffer vs window size correctly;
+      confirm `mainSurface_` matches the Metal drawable size; confirm `mousePos()` uses the
+      same coordinate space as drawing. Will matter the first time the app runs on Retina.
 - [ ] **Channel reentrancy** — callbacks fire under `cbMtx_` during `pop()`; a callback that
       (un)subscribes would deadlock. Snapshot handlers then fire outside the lock, or
       document the constraint *(review 06-29)*
@@ -212,6 +218,9 @@ Write `braid_v0.2_surface.md` first (spec → critical-fixes → impl, the cycle
   - [ ] **Color policy:** sRGB/none → upload to an `-srgb` format (GPU sampler linearizes free);
         non-sRGB ICC → mango's bundled **lcms2** transform during decode. Expose the embedded
         profile so we can branch instead of always/never converting *(review 06-29)*
+  - [ ] **`Surface::saveAsync`** — current `save()` spins `while (!done) ProcessEvents()`
+        and hitches the frame. Add async variant with callback/Channel so readback completes
+        next frame without stalling the tunnel.
   - [ ] **Keep mango behind the `Texture` seam** — no `mango::*` type in any public signature
         (ofWorks `ofImage.cpp` already proves this pattern) *(review 06-29)*
 - [ ] `Buffer` + async readback
@@ -224,6 +233,15 @@ Write `braid_v0.2_surface.md` first (spec → critical-fixes → impl, the cycle
 - [ ] `ComputePass` — GPU particles (Dawn compute; ofxDawn has a reference)
 - [ ] Text (SDF atlas) · Audio (rtaudio/miniaudio — libs in scaffold)
 - [ ] Shader hot-reload (file watcher) — tightens the creative loop
+- [ ] **Asset hot-reload** beyond shaders: `AssetWatcher` that reloads WGSL → `Shader`,
+      image → `Surface`, mesh → `Mesh` on disk change. Difference between a framework and
+      a pleasant tool.
+- [ ] **Syphon / Spout / NDI output** — route a `Surface` to Syphon (macOS), Spout
+      (Windows), or NDI: `surface.publish("braid-out")`. Natural fit for the "Surface is
+      routable" thesis; major differentiator for VJ/installation use.
+- [ ] **OSC** — minimal `OscIn`/`OscOut` on top of `Channel<T>`. Installations speak OSC.
+- [ ] **Frame-time overlay** — built-in fps + draw-call count + GPU memory HUD (or minimal
+      ImGui example). Needed for iteration; easy to defer, easy to miss.
 - **Proof:** a million-particle compute demo; text on screen; a sound playing.
 
 ---
@@ -241,7 +259,15 @@ Write `braid_v0.2_surface.md` first (spec → critical-fixes → impl, the cycle
       question if worth it). Let the LED processor do the final dither; festivals dither to 8-bit,
       VP keeps the bits all the way out *(review 06-29)*
 - [ ] **Web/Emscripten** — interesting because Dawn ≈ browser WebGPU; sketches in a tab
+- [ ] **CI builds** — GitHub Actions: build all examples on macOS on every push; catches
+      Dawn/RGFW drift early; add before the codebase grows.
+- [ ] **Semver discipline** — `VERSIONING.md` (one page: what v0.x.y means, what's a
+      breaking change, dep update policy for Dawn/RGFW). Avoids panic when a dep update
+      breaks the Metal surface code.
 - [ ] Shared `libdawn.dylib` if shipping many sketches (move the ~10MB out of each binary)
+- [ ] **Lint rule: always qualify `wgpu::`** — `braid::Surface` / `wgpu::Surface` collision
+      acknowledged but not enforced; a `clang-tidy` check or pre-commit script stops it
+      from drifting.
 - [ ] **iOS** — doable, but not free. Dawn's Metal backend runs on iOS, and `CAMetalLayer` works
       on `UIView`. The blockers are RGFW (desktop-only), the input model (touch vs mouse/keyboard),
       the app lifecycle (UIKit owns the run loop), and sandboxed file access. The right prep is to

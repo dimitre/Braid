@@ -696,16 +696,43 @@ private:
     glm::mat4 view_{1.0f};
     glm::mat4 proj_{1.0f};
 
-    Shader defaultShader_;
-    std::optional<Mesh> scratch_;  // reused per-primitive vertex buffer
     wgpu::RenderPassEncoder currentPass_;
     bool passOpen_ = false;
     bool bgRequested_ = false;  // background() called this frame → clear, else load
     bool ready_ = false;
 
-    // Uploads `verts` with the current fill color + MVP and issues one draw.
-    void drawTris(std::span<const Vertex> verts);
-    void drawLines(std::span<const Vertex> verts);  // LineList topology
+    // --- Batching ---------------------------------------------------------
+    // Primitives don't draw immediately; they append geometry to a CPU buffer
+    // and record a DrawCmd. At flush() the whole frame uploads in two writes —
+    // one growing vertex buffer + one uniform pool addressed by dynamic offset —
+    // then replays as draws, switching pipeline only when topology changes. A
+    // frame of N shapes allocates nothing in steady state (vs. a buffer + bind
+    // group per primitive before).
+    struct DrawCmd {
+        uint32_t firstVertex = 0, vertexCount = 0;
+        glm::mat4 mvp{1.0f};
+        glm::vec4 tint{1.0f};
+        bool lines = false;  // LineList vs TriangleList
+    };
+    struct SketchPipeline {
+        wgpu::TextureFormat format;
+        bool lines;
+        wgpu::RenderPipeline pipeline;
+    };
+    std::vector<Vertex> batchVerts_;
+    std::vector<DrawCmd> batchCmds_;
+    wgpu::ShaderModule sketchModule_;
+    wgpu::BindGroupLayout sketchBGL_;   // binding 0 = uniform w/ dynamic offset
+    wgpu::PipelineLayout sketchPL_;
+    std::vector<SketchPipeline> sketchPipelines_;
+    wgpu::Buffer vbo_;  size_t vboCapacity_ = 0;  // capacity in vertices
+    wgpu::Buffer ubo_;  size_t uboCapacity_ = 0;  // capacity in uniform slots
+    wgpu::BindGroup uboBindGroup_;
+
+    void drawTris(std::span<const Vertex> verts);   // append a TriangleList cmd
+    void drawLines(std::span<const Vertex> verts);  // append a LineList cmd
+    void emitBatch();                               // upload + replay into the pass
+    wgpu::RenderPipeline sketchPipeline(wgpu::TextureFormat fmt, bool lines);
     void ensurePass();
 };
 

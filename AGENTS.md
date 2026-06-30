@@ -53,7 +53,7 @@ void setup();                    // once, before frame 1
 void update();                   // each frame, before draw
 void draw();                     // each frame — the only one you usually need
 void exit();                     // on quit
-void keyPressed(braid::KeyEvent e);    // e.key (int), e.shift/ctrl/alt/super
+void keyPressed(braid::KeyEvent e);    // e.key (braid::Key), e.ch (char), e.shift/ctrl/alt/super
 void keyReleased(braid::KeyEvent e);
 void mousePressed(braid::MouseEvent e);   // e.pos, e.button
 void mouseMoved(braid::MouseEvent e);
@@ -65,6 +65,11 @@ Per-frame info available anywhere: `width()`, `height()`, `mouseX()`, `mouseY()`
 `currentFps()`.
 `setWindowTitle("text")` is cheap (throttle it, e.g. `if (frameCount()%15==0)`).
 `close()` quits. The user can always quit with **Cmd+Q** or **Esc**.
+
+Keys: use **`e.ch`** for letter/number keys (`if (e.ch == 's')`) and **`e.key`** for
+named keys (`if (e.key == braid::Key::Left)`, `Key::Space`, `Key::Escape`, …). Never
+compare against raw platform keycodes — `braid::Key` is the stable, windowing-independent
+contract.
 
 ## Sketch-tier vocabulary (`SketchApp`)
 
