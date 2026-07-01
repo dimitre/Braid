@@ -1,12 +1,19 @@
 # Braid
 
-Imagined by Dimitre after working more than one decade with openFrameworks and collaborating in Core development.
+> [!CAUTION]
+> API drift. some things can change soon
+
+> [!TIP]
+> Run this script from the folder you want ofWorks to be installed:
+```sh
+curl -fsSL https://ofworks.cc/braid.sh | bash
+```
+
+Imagined by Dimitre https://dmtr.org/ after working more than one decade with openFrameworks and collaborating in Core development.
 It derives a lot of ideas from ofWorks (openFrameworks fork).  
 After ofxDawn made possible for ofWorks with the help of Claude Opus 4.8 and Kimi 2.7 I started to discuss the usefulness of ofFbo in openFrameworks system and how to make a very compact framework of itself only based on WebGPU and modern C++
 Specification was discussed over a weekend (27, 28 june 2026) and LLM assisted coding soon after.
 
-> [!WARNING]
-> API drift. some things can change soon
 
 
 Braid is a **WebGPU creative-coding framework for macOS**. It is small, exposes a single public header (`#include "braid.h"`), and is built on a single unifying idea: **a `Surface` is the only thing you draw into.**
