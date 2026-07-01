@@ -16,11 +16,13 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <queue>
 #include <span>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 // WebGPU clip space uses depth [0,1] (like Metal/D3D/Vulkan), not GL's [-1,1].
@@ -512,33 +514,40 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// App — window + device + run loop (Tier 1).
+// App settings — extracted so Window (the base class) can use them before App
+// is fully declared.
 // ---------------------------------------------------------------------------
-class App {
-public:
-    struct Settings {
-        int width = 1280;
-        int height = 720;
-        const char* title = "Braid";
-        bool resizable = true;
-        bool vsync = true;
-        wgpu::TextureFormat format = wgpu::TextureFormat::BGRA8Unorm;
-        int targetFps = 60;
+struct AppSettings {
+    int width = 1280;
+    int height = 720;
+    const char* title = "Braid";
+    bool resizable = true;
+    bool vsync = true;
+    wgpu::TextureFormat format = wgpu::TextureFormat::BGRA8Unorm;
+    int targetFps = 60;
 #ifdef NDEBUG
-        bool enableValidation = false;  // Fix 8 — off in release
+    bool enableValidation = false;  // Fix 8 — off in release
 #else
-        bool enableValidation = true;   // Fix 8 — on in debug
+    bool enableValidation = true;   // Fix 8 — on in debug
 #endif
-    };
+};
 
-    App();  // uses default Settings (split out to avoid nested brace-init in-class)
-    explicit App(const Settings& settings);
-    virtual ~App();
+// ---------------------------------------------------------------------------
+// Window — one RGFW window + its swapchain + event pump + draw hooks.
+//
+// App is the backward-compatible public façade over an internal
+// Application/Window split. App is itself a Window (the primary one), and it
+// owns the process-wide Application that manages the shared device and the
+// global run loop. Secondary windows can be spawned with App::createWindow<T>().
+// ---------------------------------------------------------------------------
+class Application; // internal to braid_app.cpp
 
-    App(const App&) = delete;
-    App& operator=(const App&) = delete;
-    App(App&&) = delete;
-    App& operator=(App&&) = delete;
+class Window {
+public:
+    virtual ~Window();
+
+    Window(const Window&) = delete;
+    Window& operator=(const Window&) = delete;
 
     // Lifecycle hooks.
     virtual void setup() {}
@@ -559,8 +568,8 @@ public:
     virtual void mouseMoved(MouseEvent) {}
     virtual void windowResized(WindowEvent) {}
 
-    Result<void> run();   // blocks until the window closes
     void close();
+    bool shouldClose() const;
 
     // Valid during draw(): the frame's command encoder and the main Surface you
     // draw into. The main Surface persists across frames (enables feedback) and is
@@ -577,19 +586,19 @@ public:
     // same draw() (SketchApp overrides it to flush its batched primitives first).
     virtual void submitFrame();
 
-    wgpu::Device device() const { return device_; }
-    wgpu::Queue queue() const { return queue_; }
-    Timer& timer() { return timer_; }
+    wgpu::Device device() const;
+    wgpu::Queue queue() const;
+    Timer& timer() const;
 
     int width() const;
     int height() const;
-    glm::vec2 mousePos() const { return mousePos_; }
-    float mouseX() const { return mousePos_.x; }  // Processing/oF-style convenience
-    float mouseY() const { return mousePos_.y; }
-    float deltaTime() const { return timer_.deltaTime(); }
-    float elapsedTime() const { return timer_.elapsedTime(); }
-    int frameCount() const { return timer_.frameCount(); }
-    int currentFps() const { return timer_.currentFps(); }
+    glm::vec2 mousePos() const;
+    float mouseX() const;
+    float mouseY() const;
+    float deltaTime() const;
+    float elapsedTime() const;
+    int frameCount() const;
+    int currentFps() const;
 
     // ofSetWindowTitle-style. Cheap; safe to call every frame (throttle for taste).
     void setWindowTitle(const char* title);
@@ -602,33 +611,80 @@ public:
     Channel<DropEvent> dropEvents;
 
 protected:
-    Settings settings_;
-    Timer timer_;
+    friend class Application;
+
+    Window(Application& app, const AppSettings& settings);
+
+    Result<void> create();
+    void initSurface(wgpu::Surface surface);
+    void configureSurface();
+    void createSwapAndMainSurfaces();
+    void pumpQueued();
+    bool beginFrame();
+    void endFrame();
+
+    void* nativeWindow() const;
+    const AppSettings& settings() const;
+    bool setupDone() const;
+    void markSetupDone();
+
+    Application& app_;
+    AppSettings settings_;
     glm::vec2 mousePos_{0.0f};
 
-    wgpu::Instance instance_;
-    wgpu::Adapter adapter_;
-    wgpu::Device device_;
-    wgpu::Queue queue_;
-    wgpu::Surface surface_;
+    void* window_ = nullptr;  // RGFW_window*
+    bool running_ = false;
+    bool setupDone_ = false;
 
+    wgpu::Surface surface_;
     std::optional<Surface> swapSurface_;   // wraps the swapchain (present target)
     std::optional<Surface> mainSurface_;   // persistent offscreen — draw target
 
     // Per-frame state, valid only between beginFrame/endFrame.
     wgpu::CommandEncoder frameEncoder_;
     wgpu::TextureView frameView_;
+};
+
+// ---------------------------------------------------------------------------
+// App — backward-compatible façade: the first window + owner of the Application.
+// ---------------------------------------------------------------------------
+class App : public Window {
+public:
+    using Settings = AppSettings;
+
+    App();  // uses default Settings
+    explicit App(const Settings& settings);
+    ~App() override;
+
+    App(const App&) = delete;
+    App& operator=(const App&) = delete;
+    App(App&&) = delete;
+    App& operator=(App&&) = delete;
+
+    Result<void> run();   // blocks until the last window closes
+
+    // Spawn a secondary window sharing the same device and run loop.
+    // W must derive from Window and expose a constructor (Application&, const Settings&, Args...).
+    template <class W, class... Args>
+    W& createWindow(const Settings& settings, Args&&... args) {
+        static_assert(std::is_base_of_v<Window, W>, "createWindow requires a Window subclass");
+        auto w = std::make_unique<W>(application(), settings, std::forward<Args>(args)...);
+        W& ref = *w;
+        adoptSecondary(std::move(w));
+        return ref;
+    }
+
+protected:
+    // For subclasses that are used as secondary windows (they borrow an existing Application).
+    App(Application& app, const Settings& settings);
+
+    void adoptSecondary(std::unique_ptr<Window> w);
 
 private:
-    Result<void> initWindow();
-    Result<void> initWebGPU();
-    void configureSurface();
-    void pumpEvents();
-    bool beginFrame();
-    void endFrame();
+    App(const Settings& settings, std::unique_ptr<Application> app);
+    Application& application();
 
-    void* window_ = nullptr;  // RGFW_window*
-    bool running_ = false;
+    std::unique_ptr<Application> app_;
 };
 
 // ---------------------------------------------------------------------------
@@ -640,7 +696,11 @@ class SketchApp : public App {
 public:
     SketchApp();
     explicit SketchApp(const Settings& settings);
+protected:
+    // For use as a secondary window (borrows an existing Application).
+    SketchApp(Application& app, const Settings& settings);
 
+public:
     // Color / style state (client-side until a primitive is drawn).
     void background(float r, float g, float b, float a = 1.0f);
     void background(glm::vec4 color);

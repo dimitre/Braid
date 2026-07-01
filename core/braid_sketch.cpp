@@ -55,6 +55,7 @@ static constexpr uint64_t kUniformStride = 256;
 
 SketchApp::SketchApp() : SketchApp(Settings{}) {}
 SketchApp::SketchApp(const Settings& settings) : App(settings) {}
+SketchApp::SketchApp(Application& app, const Settings& settings) : App(app, settings) {}
 
 // Lazy init so a user-overridden setup() never clashes with ours. Builds the
 // default shader module + an explicit pipeline layout whose uniform binding uses

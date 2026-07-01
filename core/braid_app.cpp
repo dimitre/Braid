@@ -13,6 +13,8 @@
 #include "braid_detail.h"
 
 #include <string>
+#include <vector>
+#include <memory>
 
 #include <fmt/core.h>
 #include <fmt/format.h>
@@ -102,71 +104,50 @@ static char printableChar(RGFW_key v) {
 }
 
 // ===========================================================================
-// App
+// Forward declarations (defined later in this TU)
 // ===========================================================================
-App::App() : App(Settings{}) {}
-App::App(const Settings& settings) : settings_(settings), timer_(settings.targetFps) {}
-App::~App() {
-    if (window_) RGFW_window_close(static_cast<RGFW_window*>(window_));
-    RGFW_deinit();
+class Application;
+
+// ===========================================================================
+// DeviceContext — one instance + adapter + device + queue for the process.
+// ===========================================================================
+class DeviceContext {
+public:
+    static Result<std::unique_ptr<DeviceContext>> create(void* metalLayer,
+                                                         const AppSettings& settings);
+
+    wgpu::Instance instance() const { return instance_; }
+    wgpu::Device device() const { return device_; }
+    wgpu::Queue queue() const { return queue_; }
+
+    // The surface that was used to request the adapter. Handed to the primary window.
+    wgpu::Surface takeSurface() { return std::move(surface_); }
+
+private:
+    DeviceContext() = default;
+    Result<void> init(void* metalLayer, const AppSettings& settings);
+
+    wgpu::Instance instance_;
+    wgpu::Adapter adapter_;
+    wgpu::Device device_;
+    wgpu::Queue queue_;
+    wgpu::Surface surface_;
+};
+
+Result<std::unique_ptr<DeviceContext>> DeviceContext::create(void* metalLayer,
+                                                             const AppSettings& settings) {
+    auto ctx = std::unique_ptr<DeviceContext>(new DeviceContext());
+    if (auto r = ctx->init(metalLayer, settings); !r)
+        return Result<std::unique_ptr<DeviceContext>>::failure(r.error);
+    return Result<std::unique_ptr<DeviceContext>>::success(std::move(ctx));
 }
 
-int App::width() const { return settings_.width; }
-int App::height() const { return settings_.height; }
-
-wgpu::CommandEncoder& App::encoder() { return frameEncoder_; }
-Surface& App::surface() { return *mainSurface_; }
-
-void App::submitFrame() {
-    wgpu::CommandBuffer cmd = frameEncoder_.Finish();
-    queue_.Submit(1, &cmd);
-    frameEncoder_ = device_.CreateCommandEncoder();
-}
-
-void App::setWindowTitle(const char* title) {
-    if (!window_) return;
-    // Set the NSWindow title under our own autorelease pool. RGFW_window_setName
-    // autoreleases the NSString into RGFW's event pool, and calling it from draw()
-    // (outside that pool's scope) corrupts the balance and trips shouldClose.
-    auto* win = static_cast<RGFW_window*>(window_);
-    using Msg = id (*)(id, SEL);
-    using MsgStr = id (*)(id, SEL, const char*);
-    using MsgId = void (*)(id, SEL, id);
-    id pool = reinterpret_cast<Msg>(objc_msgSend)(
-        reinterpret_cast<id>(objc_getClass("NSAutoreleasePool")), sel_registerName("alloc"));
-    pool = reinterpret_cast<Msg>(objc_msgSend)(pool, sel_registerName("init"));
-    id str = reinterpret_cast<MsgStr>(objc_msgSend)(
-        reinterpret_cast<id>(objc_getClass("NSString")), sel_registerName("stringWithUTF8String:"),
-        title);
-    reinterpret_cast<MsgId>(objc_msgSend)(reinterpret_cast<id>(win->src.window),
-                                          sel_registerName("setTitle:"), str);
-    reinterpret_cast<Msg>(objc_msgSend)(pool, sel_registerName("drain"));
-}
-
-Result<void> App::initWindow() {
-    RGFW_init("braid", (RGFW_initFlags)0);
-    RGFW_windowFlags flags = RGFW_windowCenter | RGFW_windowFocus | RGFW_windowFocusOnShow;
-    if (!settings_.resizable) flags |= RGFW_windowNoResize;
-    RGFW_window* win = RGFW_createWindow(settings_.title, 0, 0, settings_.width, settings_.height,
-                                         flags);
-    if (!win) return Result<void>::failure("RGFW_createWindow failed");
-    window_ = win;
-    mousePos_ = {settings_.width * 0.5f, settings_.height * 0.5f};  // neutral until moved
-    RGFW_window_setExitKey(win, RGFW_keyEscape);  // Esc quits (Cmd+Q handled in pump)
-    RGFW_window_show(win);
-    RGFW_window_raise(win);
-    RGFW_window_focus(win);
-    return Result<void>::success();
-}
-
-Result<void> App::initWebGPU() {
+Result<void> DeviceContext::init(void* metalLayer, const AppSettings& settings) {
     wgpu::InstanceDescriptor instDesc{};
     instance_ = wgpu::CreateInstance(&instDesc);
     if (!instance_) return Result<void>::failure("wgpu::CreateInstance failed");
 
     // --- Surface from the Metal layer [VERIFY] ---
-    void* metalLayer = attachMetalLayer(window_);
-    if (!metalLayer) return Result<void>::failure("attachMetalLayer failed");
     wgpu::SurfaceSourceMetalLayer metalSrc{};
     metalSrc.layer = metalLayer;
     wgpu::SurfaceDescriptor surfDesc{};
@@ -218,21 +199,187 @@ Result<void> App::initWebGPU() {
 
     queue_ = device_.GetQueue();
     detail::setContext(instance_, device_);
-    configureSurface();
-    // swapchain wrap (present target, 8-bit) + persistent offscreen main draw
-    // target in 16-bit float (smooth feedback, HDR accumulation).
-    swapSurface_.emplace(surface_, settings_.width, settings_.height, settings_.format);
-    mainSurface_.emplace(device_, settings_.width, settings_.height,
-                         wgpu::TextureFormat::RGBA16Float);
-    // WebGPU zero-initializes textures (alpha=0). Clear to opaque black so that
-    // Surface algebra (invert, pasteSelf) and save() always see alpha=1 from frame 1.
-    mainSurface_->clear({0, 0, 0, 1});
     return Result<void>::success();
 }
 
-void App::configureSurface() {
+// ===========================================================================
+// Application — process-wide: RGFW init/deinit, shared device, global run loop.
+// ===========================================================================
+class Application {
+public:
+    Application() = default;
+    ~Application() {
+        // Destroy secondary windows (and their surfaces) before the device.
+        secondaries_.clear();
+        ctx_.reset();
+        if (rgfwInit_) RGFW_deinit();
+    }
+
+    Application(const Application&) = delete;
+    Application& operator=(const Application&) = delete;
+
+    void setPrimary(Window* primary) { primary_ = primary; }
+
+    Result<void> ensureInitialized() {
+        if (initialized_) return Result<void>::success();
+        if (!primary_) return Result<void>::failure("no primary window");
+
+        RGFW_init("braid", (RGFW_initFlags)0);
+        rgfwInit_ = true;
+
+        if (auto r = primary_->create(); !r) return r;
+
+        void* metalLayer = attachMetalLayer(primary_->nativeWindow());
+        if (!metalLayer) return Result<void>::failure("attachMetalLayer failed");
+
+        auto ctx = DeviceContext::create(metalLayer, primary_->settings());
+        if (!ctx) return Result<void>::failure(ctx.error);
+        ctx_ = std::move(*ctx.value);
+
+        primary_->initSurface(ctx_->takeSurface());
+        primary_->configureSurface();
+        primary_->createSwapAndMainSurfaces();
+
+        timer_.setFps(primary_->settings().targetFps);
+        initialized_ = true;
+        return Result<void>::success();
+    }
+
+    void registerSecondary(std::unique_ptr<Window> w) {
+        if (auto r = ensureInitialized(); !r) {
+            fmt::print(stderr, "[braid] createWindow failed: {}\n", r.error);
+            std::abort();
+        }
+        if (auto r = w->create(); !r) {
+            fmt::print(stderr, "[braid] createWindow failed: {}\n", r.error);
+            std::abort();
+        }
+        void* layer = attachMetalLayer(w->nativeWindow());
+        if (!layer) {
+            fmt::print(stderr, "[braid] createWindow: attachMetalLayer failed\n");
+            std::abort();
+        }
+        wgpu::SurfaceSourceMetalLayer metalSrc{};
+        metalSrc.layer = layer;
+        wgpu::SurfaceDescriptor surfDesc{};
+        surfDesc.nextInChain = &metalSrc;
+        wgpu::Surface surface = ctx_->instance().CreateSurface(&surfDesc);
+        if (!surface) {
+            fmt::print(stderr, "[braid] createWindow: CreateSurface failed\n");
+            std::abort();
+        }
+        w->initSurface(std::move(surface));
+        w->configureSurface();
+        w->createSwapAndMainSurfaces();
+        secondaries_.push_back(std::move(w));
+    }
+
+    Result<void> run() {
+        if (auto r = ensureInitialized(); !r) return r;
+
+        running_ = true;
+        timer_.reset();
+        if (primary_ && !primary_->setupDone_) {
+            primary_->setup();
+            primary_->setupDone_ = true;
+        }
+
+        while (running_) {
+            timer_.waitNext();
+            RGFW_pollEvents();
+
+            if (primary_) primary_->pumpQueued();
+            for (auto& w : secondaries_) w->pumpQueued();
+
+            if (primary_ && primary_->shouldClose()) running_ = false;
+            for (auto it = secondaries_.begin(); it != secondaries_.end(); ) {
+                if ((*it)->shouldClose()) it = secondaries_.erase(it);
+                else ++it;
+            }
+            if (!primary_ && secondaries_.empty()) running_ = false;
+
+            if (running_) {
+                if (primary_) {
+                    primary_->update();
+                    drawWindow(*primary_);
+                }
+                for (auto& w : secondaries_) {
+                    w->update();
+                    drawWindow(*w);
+                }
+            }
+
+            if (ctx_) ctx_->instance().ProcessEvents();
+        }
+
+        if (primary_) primary_->exit();
+        return Result<void>::success();
+    }
+
+    void stop() { running_ = false; }
+
+    wgpu::Instance instance() const { return ctx_ ? ctx_->instance() : nullptr; }
+    wgpu::Device device() const { return ctx_ ? ctx_->device() : nullptr; }
+    wgpu::Queue queue() const { return ctx_ ? ctx_->queue() : nullptr; }
+    Timer& timer() { return timer_; }
+
+private:
+    void drawWindow(Window& w) {
+        if (w.shouldClose()) return;
+        if (!w.setupDone_) {
+            w.setup();
+            w.setupDone_ = true;
+        }
+        if (w.beginFrame()) {
+            w.beforeDraw();
+            w.draw();
+            w.afterDraw();
+            w.endFrame();
+        }
+    }
+
+    bool rgfwInit_ = false;
+    bool initialized_ = false;
+    bool running_ = false;
+    Window* primary_ = nullptr;
+    std::vector<std::unique_ptr<Window>> secondaries_;
+    std::unique_ptr<DeviceContext> ctx_;
+    Timer timer_;
+};
+
+// ===========================================================================
+// Window method implementations
+// ===========================================================================
+Window::Window(Application& app, const AppSettings& settings)
+    : app_(app), settings_(settings) {}
+
+Window::~Window() {
+    if (window_) {
+        RGFW_window_close(static_cast<RGFW_window*>(window_));
+    }
+}
+
+Result<void> Window::create() {
+    RGFW_windowFlags flags = RGFW_windowCenter | RGFW_windowFocus | RGFW_windowFocusOnShow;
+    if (!settings_.resizable) flags |= RGFW_windowNoResize;
+    RGFW_window* win = RGFW_createWindow(settings_.title, 0, 0, settings_.width, settings_.height,
+                                         flags);
+    if (!win) return Result<void>::failure("RGFW_createWindow failed");
+    window_ = win;
+    mousePos_ = {settings_.width * 0.5f, settings_.height * 0.5f};
+    RGFW_window_setExitKey(win, RGFW_keyEscape);
+    RGFW_window_show(win);
+    RGFW_window_raise(win);
+    RGFW_window_focus(win);
+    running_ = true;
+    return Result<void>::success();
+}
+
+void Window::initSurface(wgpu::Surface surface) { surface_ = std::move(surface); }
+
+void Window::configureSurface() {
     wgpu::SurfaceConfiguration config{};
-    config.device = device_;
+    config.device = device();
     config.format = settings_.format;
     config.usage = wgpu::TextureUsage::RenderAttachment;
     config.width = static_cast<uint32_t>(settings_.width);
@@ -242,10 +389,19 @@ void App::configureSurface() {
     surface_.Configure(&config);
 }
 
-void App::pumpEvents() {
+void Window::createSwapAndMainSurfaces() {
+    swapSurface_.emplace(surface_, settings_.width, settings_.height, settings_.format);
+    mainSurface_.emplace(device(), settings_.width, settings_.height,
+                         wgpu::TextureFormat::RGBA16Float);
+    // WebGPU zero-initializes textures (alpha=0). Clear to opaque black so that
+    // Surface algebra (invert, pasteSelf) and save() always see alpha=1 from frame 1.
+    mainSurface_->clear({0, 0, 0, 1});
+}
+
+void Window::pumpQueued() {
     auto* win = static_cast<RGFW_window*>(window_);
     RGFW_event ev;
-    while (RGFW_window_checkEvent(win, &ev)) {
+    while (RGFW_window_checkQueuedEvent(win, &ev)) {
         switch (ev.type) {
             case RGFW_keyPressed: {
                 KeyEvent e{};
@@ -257,7 +413,7 @@ void App::pumpEvents() {
                 e.ctrl = (ev.key.mod & RGFW_modControl) != 0;
                 e.alt = (ev.key.mod & RGFW_modAlt) != 0;
                 e.super = (ev.key.mod & RGFW_modSuper) != 0;
-                if (e.super && e.key == Key::Q) running_ = false;  // Cmd+Q quits
+                if (e.super && e.key == Key::Q) running_ = false;
                 keyEvents.push(e);
                 keyPressed(e);
                 break;
@@ -333,7 +489,7 @@ void App::pumpEvents() {
     while (dropEvents.pop()) {}
 }
 
-bool App::beginFrame() {
+bool Window::beginFrame() {
     wgpu::SurfaceTexture surfTex;
     surface_.GetCurrentTexture(&surfTex);
     if (surfTex.status != wgpu::SurfaceGetCurrentTextureStatus::SuccessOptimal &&
@@ -343,50 +499,106 @@ bool App::beginFrame() {
         return false;
     }
     frameView_ = surfTex.texture.CreateView();
-    frameEncoder_ = device_.CreateCommandEncoder();
+    frameEncoder_ = device().CreateCommandEncoder();
     swapSurface_->setCurrentView(frameView_);
     return true;
 }
 
-void App::endFrame() {
+void Window::endFrame() {
     // "The screen is the Surface you show": blit the persistent main Surface onto
     // the swapchain. This single copy is what makes screenshot/record/feedback free.
     detail::BlitUniforms u{};
     detail::compositor().blit(frameEncoder_, swapSurface_->asTexture(), settings_.format,
                               mainSurface_->asTexture(), u, Blend::None, wgpu::LoadOp::Clear);
     wgpu::CommandBuffer cmd = frameEncoder_.Finish();
-    queue_.Submit(1, &cmd);
+    queue().Submit(1, &cmd);
     surface_.Present();
-    instance_.ProcessEvents();  // service async work (maps, device callbacks)
     frameEncoder_ = nullptr;
     frameView_ = nullptr;
 }
 
-Result<void> App::run() {
-    if (auto r = initWindow(); !r) return r;
-    if (auto r = initWebGPU(); !r) return r;
-
-    setup();
-    running_ = true;
-    timer_.reset();
-
-    auto* win = static_cast<RGFW_window*>(window_);
-    while (running_ && !RGFW_window_shouldClose(win)) {
-        timer_.waitNext();
-        pumpEvents();
-        update();
-        if (beginFrame()) {
-            beforeDraw();
-            draw();
-            afterDraw();
-            endFrame();
-        }
-    }
-
-    exit();
-    return Result<void>::success();
+void Window::submitFrame() {
+    wgpu::CommandBuffer cmd = frameEncoder_.Finish();
+    queue().Submit(1, &cmd);
+    frameEncoder_ = device().CreateCommandEncoder();
 }
 
-void App::close() { running_ = false; }
+void Window::setWindowTitle(const char* title) {
+    if (!window_) return;
+    // Set the NSWindow title under our own autorelease pool. RGFW_window_setName
+    // autoreleases the NSString into RGFW's event pool, and calling it from draw()
+    // (outside that pool's scope) corrupts the balance and trips shouldClose.
+    auto* win = static_cast<RGFW_window*>(window_);
+    using Msg = id (*)(id, SEL);
+    using MsgStr = id (*)(id, SEL, const char*);
+    using MsgId = void (*)(id, SEL, id);
+    id pool = reinterpret_cast<Msg>(objc_msgSend)(
+        reinterpret_cast<id>(objc_getClass("NSAutoreleasePool")), sel_registerName("alloc"));
+    pool = reinterpret_cast<Msg>(objc_msgSend)(pool, sel_registerName("init"));
+    id str = reinterpret_cast<MsgStr>(objc_msgSend)(
+        reinterpret_cast<id>(objc_getClass("NSString")), sel_registerName("stringWithUTF8String:"),
+        title);
+    reinterpret_cast<MsgId>(objc_msgSend)(reinterpret_cast<id>(win->src.window),
+                                          sel_registerName("setTitle:"), str);
+    reinterpret_cast<Msg>(objc_msgSend)(pool, sel_registerName("drain"));
+}
+
+bool Window::shouldClose() const {
+    return !running_ || (window_ && RGFW_window_shouldClose(static_cast<RGFW_window*>(window_)));
+}
+
+void Window::close() { running_ = false; }
+
+wgpu::Device Window::device() const { return app_.device(); }
+wgpu::Queue Window::queue() const { return app_.queue(); }
+Timer& Window::timer() const { return app_.timer(); }
+int Window::width() const { return settings_.width; }
+int Window::height() const { return settings_.height; }
+glm::vec2 Window::mousePos() const { return mousePos_; }
+float Window::mouseX() const { return mousePos_.x; }
+float Window::mouseY() const { return mousePos_.y; }
+float Window::deltaTime() const { return timer().deltaTime(); }
+float Window::elapsedTime() const { return timer().elapsedTime(); }
+int Window::frameCount() const { return timer().frameCount(); }
+int Window::currentFps() const { return timer().currentFps(); }
+wgpu::CommandEncoder& Window::encoder() { return frameEncoder_; }
+Surface& Window::surface() { return *mainSurface_; }
+
+void* Window::nativeWindow() const { return window_; }
+const AppSettings& Window::settings() const { return settings_; }
+bool Window::setupDone() const { return setupDone_; }
+void Window::markSetupDone() { setupDone_ = true; }
+
+// ===========================================================================
+// App — backward-compatible façade: the first window + owner of the Application.
+// ===========================================================================
+App::App() : App(Settings{}) {}
+
+App::App(const Settings& settings) : App(settings, std::make_unique<Application>()) {}
+
+App::App(const Settings& settings, std::unique_ptr<Application> app)
+    : Window(*app, settings), app_(std::move(app)) {}
+
+App::App(Application& app, const Settings& settings) : Window(app, settings) {}
+
+App::~App() {
+    // Close our RGFW window *before* the Application member is destroyed,
+    // because ~Application calls RGFW_deinit().
+    if (window_) {
+        RGFW_window_close(static_cast<RGFW_window*>(window_));
+        window_ = nullptr;
+    }
+}
+
+Application& App::application() { return *app_; }
+
+Result<void> App::run() {
+    application().setPrimary(this);
+    return application().run();
+}
+
+void App::adoptSecondary(std::unique_ptr<Window> w) {
+    application().registerSecondary(std::move(w));
+}
 
 }  // namespace braid
