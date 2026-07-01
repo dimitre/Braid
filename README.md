@@ -3,7 +3,7 @@
 Imagined by Dimitre after working more than one decade with openFrameworks and collaborating in Core development.
 It derives a lot of ideas from ofWorks (openFrameworks fork).
 
-Braid is a **WebGPU creative-coding framework for macOS**. It is small, single-file-ish, and built on a single unifying idea: **a `Surface` is the only thing you draw into.**
+Braid is a **WebGPU creative-coding framework for macOS**. It is small, exposes a single public header (`#include "braid.h"`), and is built on a single unifying idea: **a `Surface` is the only thing you draw into.**
 
 The screen is a Surface. An offscreen buffer is a Surface. An image is a Surface. They all compose with the same algebra — add, blend, zoom, rotate, shift, invert — so layers, feedback loops, and post-processing are all one vocabulary, not three different APIs.
 

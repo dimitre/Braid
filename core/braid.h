@@ -569,6 +569,14 @@ public:
     Surface& surface();           // the main offscreen Surface — draw here
     Surface& screen() { return surface(); }  // alias
 
+    // Submits everything recorded into encoder() so far, then starts a fresh
+    // encoder for the rest of the frame. Surface algebra (bloom/blur/threshold/
+    // paste/...) submits its own command buffers immediately, so it only ever
+    // sees GPU work that's already been submitted — not merely recorded. Call
+    // this before such a call if it needs to see drawing done earlier in this
+    // same draw() (SketchApp overrides it to flush its batched primitives first).
+    virtual void submitFrame();
+
     wgpu::Device device() const { return device_; }
     wgpu::Queue queue() const { return queue_; }
     Timer& timer() { return timer_; }
@@ -679,6 +687,7 @@ public:
     // Escape hatch back to Tier 1.
     wgpu::RenderPassEncoder& pass();
     void flush();
+    void submitFrame() override;  // also flushes any pending batched primitives first
 
 protected:
     void beforeDraw() override;  // reset per-frame state, lazy init
@@ -741,6 +750,13 @@ private:
 
     void drawTris(std::span<const Vertex> verts);   // append a TriangleList cmd
     void drawLines(std::span<const Vertex> verts);  // append a LineList cmd
+    // Fill-only quad (no outline) — what public quad() used to be. Internal building
+    // block for line()/strokeOutline() so they don't recurse through quad()'s outline.
+    void fillQuad(glm::vec2 a, glm::vec2 b, glm::vec2 c, glm::vec2 d);
+    // Stroke the edges of a polygon (in the same local space as the fill) with the
+    // current stroke color/weight, as strokeWeight-thick quads — same technique line()
+    // already uses for a single segment. closed=true also strokes the last→first edge.
+    void strokeOutline(std::span<const glm::vec2> pts, bool closed);
     void emitBatch();                               // upload + replay into the pass
     wgpu::RenderPipeline sketchPipeline(wgpu::TextureFormat fmt, bool lines);
     void ensurePass();

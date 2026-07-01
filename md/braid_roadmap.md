@@ -1,10 +1,109 @@
 # Braid — Roadmap
 
-**Updated:** 2026-06-29
+**Updated:** 2026-06-30
 **Now:** v0.1.0 → **v0.2.3 core implemented and verified** (macOS/arm64). Surface is the
 one primitive; algebra + self-feedback work; the ouroboros tunnel was captured to a file.
 **Spirit:** a *fast* creative-coding microframework. Every milestone is a thing you can
 **see/run**, not a pile of plumbing. If a step doesn't end in a demo, it's too big.
+
+---
+
+## ⏭ Immediate (review 2026-06-30)
+Fresh read of `README.md`, `core/braid.h`, `core/braid.cpp`, `core/braid_image.cpp`,
+`chalet.yaml`, and the examples. These are the items that surfaced as live concerns,
+ordered by the user's stated priority.
+
+1. **Multi-window support — *most important now.***
+   The current `App` owns a single `window_`, a single `wgpu::Surface`, and the global
+   `detail::g_ctx`/`detail::g_compositor` are process-wide singletons. This is the
+   architectural blocker for multi-window: every window needs its own RGFW window,
+   swapchain `Surface`, input pump, and ideally its own device context/compositor state.
+   `App` should become a per-window object (or a `Window` handle owned by a shared
+   `Application`), and the global `Context`/`Compositor` should become per-device or
+   per-instance rather than global. This is the foundational refactor that unlocks
+   everything below.
+   - Refactor `detail::Context` from a singleton to an instance owned by the platform
+     layer and passed to Surfaces/Shaders.
+   - Refactor `detail::Compositor` from a singleton to per-device (or per-window)
+     state.
+   - Separate "application lifetime" (instance/adapter/device) from "window lifetime"
+     (RGFW window + swapchain + event pump).
+   - Proof: `examples/multiwindow.cpp` opens two windows, each with its own sketch,
+     each rendering independently at 60fps.
+   - 🟡 **Design done 06-30 → `md/braid_multiwindow.md`** (RGFW multi-window model +
+     WebGPU shared-context analysis, grounded in the RGFW header). Findings: RGFW is
+     multi-window native but its init/deinit are *global* (do them once), and events
+     flow through one shared 32-slot queue that must be drained per-window after a single
+     `RGFW_pollEvents()`; each window gets its own `CAMetalLayer` → own `wgpu::Surface`.
+     "Share context" in WebGPU = **one `Device` for all windows** (there is no per-window
+     context), so today's global `g_ctx`/`g_compositor` already model the shared device
+     *correctly* — the real blocker is that `App` fuses library-init + device + window +
+     loop and `~App` calls `RGFW_deinit()` globally. Recommended path: split app-lifetime
+     from window-lifetime and keep `App` as the first window so no example breaks.
+     **Implementation pending.**
+
+2. **HiDPI / Retina rendering — currently not real, high priority.**
+   Investigated 2026-06-30: RGFW *does* expose the pieces (`monitor.pixelRatio` correctly
+   reads `backingScaleFactor` on macOS, plus `RGFW_window_getSizeInPixels()` and an
+   `RGFW_scaleUpdated` event) but braid never calls any of them.
+   - `RGFW_windowResized` (`core/braid.cpp:1444-1454`) uses `win->w/h` — logical points,
+     not physical pixels — and that logical size is fed straight into the WGPU surface
+     config (`core/braid.cpp:1373-1374`).
+   - `attachMetalLayer()` (`core/braid.cpp:1184-1190`) grabs a bare `CAMetalLayer` and
+     attaches it via `RGFW_window_setLayer_OSX`, which is just `setLayer:` — nothing ever
+     sets `layer.contentsScale`, which defaults to 1.0 regardless of the screen.
+   - Net effect: on a Retina display the swapchain renders at logical (1x) resolution and
+     the compositor upscales it — soft/blurry output, not true HiDPI.
+   - Fix: on window creation and on `RGFW_scaleUpdated`, read the monitor's pixel ratio,
+     set `contentsScale` on the Metal layer, and configure the WGPU surface/`mainSurface_`
+     at `logical_size * pixelRatio`. Keep mouse/input coordinates in logical points (UI
+     space) — only the drawable/backing store needs the pixel size.
+   - Supersedes the parked bullet in v0.1.1 below; do this before it's a live bug on
+     someone's Retina screen.
+3. **Break up the single big translation unit — ✅ done 06-30.**
+   `core/braid.cpp` (~1,900 lines) is gone; the implementation is now focused TUs behind
+   the single public header `core/braid.h`:
+   - `braid_timer.cpp` (Timer — pure CPU, headless-testable)
+   - `braid_compositor.{h,cpp}` (internal blit/blur/threshold/quad engine + the two
+     process-wide singletons `detail::Context` and `detail::Compositor`, co-located so
+     the future de-singleton has one home; new internal header shares the uniform structs)
+   - `braid_surface.cpp` (Surface algebra, transforms, feedback, paste)
+   - `braid_mesh.cpp` (Mesh generators + buffers)
+   - `braid_shader.cpp` (WGSL compile + pipeline cache + uniform ring)
+   - `braid_app.cpp` (window + device + event pump + run loop — the **only** TU that
+     compiles `RGFW_IMPLEMENTATION` + Cocoa/Metal glue)
+   - `braid_sketch.cpp` (SketchApp state + batching + default shader)
+   - Blend presets live in `braid_compositor.cpp`; addons unchanged (`braid_image.cpp`
+     and syntype reach core only via `detail::ctx()` in `braid_detail.h`).
+   - Verified: `chalet build` of braid-core + all 11 executables (incl. both addons)
+     succeeds — no duplicate symbols, no undefined refs; `cubes` runs clean (no
+     validation errors). No public API change. (`braid_result.cpp`/`braid_channel.cpp`
+     were unneeded — Result/Channel are header-only templates.)
+
+4. **Correct the README/marketing about "single-file-ish."**
+   The README says "small, single-file-ish." This is not a virtue, and it is not
+   accurate (`core/braid.cpp` is ~1,900 lines, plus `braid_image.cpp`, plus headers).
+   Replace with honest framing: **single public header (`#include "braid.h"`) with a
+   modular implementation.** The header is the contract; the implementation can be
+   many files. Don't celebrate monolithic source.
+
+5. **Audit and reduce global state.**
+   Related to multi-window: `detail::g_ctx` and `detail::g_compositor` are global.
+   Even for single-window, this makes unit testing and deterministic cleanup harder.
+   Move toward explicit ownership: `App` (or a new `DeviceContext`) holds the
+   `Context`, and Surfaces borrow it on construction. This enables both multi-window
+   and a future non-GPU test harness.
+
+6. **Add non-GPU tests before the refactor grows.**
+   The public API has testable seams: `Result<T>`, `Channel<T>`, `Timer`, `remap()`,
+   `Mesh` CPU generators. Add a small test target (even a single `tests/braid_test.cpp`)
+   that exercises these without touching Dawn/RGFW. Run it in CI. This pays off
+   especially once the TU split lands.
+
+7. **Shader hot-reload / asset watcher (creative-loop priority).**
+   For a creative-coding tool, iteration speed dominates. Add a minimal file watcher
+   that reloads `.wgsl` files into `Shader` objects and images into `Surface::load()`
+   on disk change. This is higher user value than compute/text/audio for now.
 
 ---
 
@@ -39,7 +138,7 @@ handlers, fire outside the lock) · clear the `braid.cpp` Metal `[VERIFY]` tag.
 
 ---
 
-### Implementation status (2026-06-29)
+### Implementation status (2026-06-30)
 - ✅ **v0.2.0 Surface pivot** — `Screen`→`Surface`; App draws into a persistent offscreen
   `Surface`, blitted to the swapchain at present. (`save()` later moved to braid-image, v0.3.0b.)
 - ✅ **v0.2.1 Algebra** — `+=`, `over`, `zoom/rotate/shift/invert/multiply/clear`; total
@@ -52,9 +151,14 @@ handlers, fire outside the lock) · clear the `braid.cpp` Metal `[VERIFY]` tag.
   wireframe lattice). Fixed: per-primitive uniform collision (hundreds of draws were sharing
   the 3-slot ring → now a fresh uniform buffer per primitive).
   Batching done 06-29 (deferred draws → shared vertex buffer + dynamic-offset uniform pool).
-  **remaining:** real stroke outlines, `image()` placed-quad, solid `box`/`sphere` fill (needs depth).
-- Examples: `hello`, `sketch`, `feedback`, `playground`, `cubes` — all build+run, all in `.zed`.
-  Cmd+Shift+R runs playground; Cmd+Q/Esc quit; fps-in-title helper.
+  ✅ **Real stroke outlines** — done 06-30. `rect`/`triangle`/`quad`/`ellipse`/`circle` now
+  stroke their edges (strokeWeight-thick quads via a new `strokeOutline()` helper, same
+  technique `line()` used for one segment); `line()`/`point()` refactored onto the same
+  path. Verified via `feedback.cpp` smoke test → `stroke_test.png` (filled+stroked rect,
+  stroked circle, `noFill()` stroked triangle/quad all render correctly).
+  **remaining:** `image()` placed-quad, solid `box`/`sphere` fill (needs depth).
+- Examples: `hello`, `sketch`, `feedback`, `playground`, `cubes`, `image`, `bloom` — all
+  build+run, all in `.zed`. Cmd+Shift+R runs playground; Cmd+Q/Esc quit; fps-in-title helper.
 
 - ✅ **v0.3.0a Image load** — `Surface::load(path)` (mango SIMD decode → `WriteTexture`,
   single-copy). The texture object *is* a Surface, so loaded images compose with the whole
@@ -70,6 +174,13 @@ handlers, fire outside the lock) · clear the `braid.cpp` Metal `[VERIFY]` tag.
   `load`/`save` are *declared* in `braid.h` but *defined* in the addon (link-to-enable).
   Shared seam: `braid_detail.h` exposes `detail::ctx()` to addon TUs.
   **remaining:** sRGB color policy, `loadAsync`, `image()` placed-quad — see `braid_v0.3_textures.md`.
+- ✅ **v0.3.0c Bloom** — done 06-30 (commit `4320619`). `Surface::blur(radius)` (separable
+  Gaussian, H+V in one submit), `Surface::threshold(level, knee)` (HDR-honest brightpass —
+  16F means "bright" is literally >1.0), and `Surface::bloom(threshold, intensity, passes)`
+  as sugar over `s += blur(threshold(clone(s)))`. `examples/bloom.cpp` verified. Per
+  `braid_v0.3_bloom.md`: the dual-filter/pyramid downsample (phase 0.3.0c in that doc) was
+  *not* taken — current `blur` is a direct separable pass, so very wide radii are not yet
+  cheap; fine for the radii bloom actually uses, worth revisiting if a sketch wants `blur(64)`+.
 
 ---
 
@@ -150,9 +261,8 @@ So this milestone is minor polish, done whenever.
       No sketch sees an RGFW code → windowing stays a swappable joint. Examples migrated.
 - [ ] **Harden the Metal surface** — clear the `braid.cpp:909 [VERIFY]` tag once confirmed
       across resize + HiDPI; it's the platform code with the least margin *(review 06-29)*
-- [ ] **HiDPI / content-scale** — verify `RGFW` reports framebuffer vs window size correctly;
-      confirm `mainSurface_` matches the Metal drawable size; confirm `mousePos()` uses the
-      same coordinate space as drawing. Will matter the first time the app runs on Retina.
+- [ ] **HiDPI / content-scale** — moved to the top of Immediate (2026-06-30), see item 2
+      there for the confirmed root cause and fix.
 - [ ] **Channel reentrancy** — callbacks fire under `cbMtx_` during `pop()`; a callback that
       (un)subscribes would deadlock. Snapshot handlers then fire outside the lock, or
       document the constraint *(review 06-29)*

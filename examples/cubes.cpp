@@ -47,11 +47,18 @@ public:
         }
         popMatrix();
 
+        // The cubes above are only *recorded* into the batch; bloom() submits its
+        // own GPU work immediately and would otherwise run before the cubes are
+        // actually rasterized. Flush them to the GPU first so bloom sees them.
+        submitFrame();
+
         if (frameCount() % 15 == 0) {
             char buf[64];
             std::snprintf(buf, sizeof(buf), "cubes · %d fps", currentFps());
             setWindowTitle(buf);
         }
+
+        surface().bloom(0.1f, 2.0f, 4);
     }
 };
 

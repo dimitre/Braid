@@ -50,7 +50,15 @@ targets:
     kind: staticLibrary
     files:
       include:
-        - core/braid.cpp # compiles RGFW_IMPLEMENTATION + braid impl
+        # Modular implementation behind the single public header (core/braid.h).
+        # braid_app.cpp is the only TU that compiles RGFW_IMPLEMENTATION + Cocoa.
+        - core/braid_timer.cpp
+        - core/braid_compositor.cpp
+        - core/braid_surface.cpp
+        - core/braid_shader.cpp
+        - core/braid_mesh.cpp
+        - core/braid_app.cpp
+        - core/braid_sketch.cpp
 
   # First addon: image file I/O. Defines Surface::load / Surface::save against the
   # mango decode/encode stack. Only targets that need image I/O link this (and the
