@@ -6,6 +6,7 @@
 // which keeps per-rect uniforms trivially correct with no ring-buffer to
 // manage — plenty fast at UI scale (tens of widgets).
 #include "braid_ui.h"
+#include "braid_text.h"
 
 #include <cctype>
 #include <cmath>
@@ -166,6 +167,144 @@ void fillRect(Surface& target, glm::vec2 pos, glm::vec2 size, glm::vec4 color) {
     target.device().GetQueue().Submit(1, &cmd);
 }
 
+// ===========================================================================
+// TextRenderer — built-in bitmap font for widget labels.
+// ===========================================================================
+const char* kTextWGSL = R"WGSL(
+@group(0) @binding(0) var fontTex : texture_2d<f32>;
+@group(0) @binding(1) var fontSampler : sampler;
+
+struct VSOut {
+    @builtin(position) pos : vec4<f32>,
+    @location(0) uv : vec2<f32>,
+    @location(1) color : vec4<f32>,
+};
+
+@vertex
+fn vs(@location(0) position : vec3<f32>,
+      @location(1) uv : vec2<f32>,
+      @location(2) normal : vec3<f32>,
+      @location(3) color : vec4<f32>) -> VSOut {
+    var o : VSOut;
+    o.pos = vec4<f32>(position, 1.0);
+    o.uv = uv;
+    o.color = color;
+    return o;
+}
+
+@fragment
+fn fs(in : VSOut) -> @location(0) vec4<f32> {
+    let a = textureSample(fontTex, fontSampler, in.uv).r;
+    return vec4<f32>(in.color.rgb, in.color.a * a);
+}
+)WGSL";
+
+class TextRenderer {
+public:
+    void ensure(wgpu::Device device) {
+        if (ready_) return;
+        device_ = device;
+
+        font_ = std::make_unique<BitmapFont>(device_);
+
+        wgpu::ShaderSourceWGSL src{};
+        src.code = kTextWGSL;
+        wgpu::ShaderModuleDescriptor smd{};
+        smd.nextInChain = &src;
+        smd.label = "braid-ui-text";
+        module_ = device_.CreateShaderModule(&smd);
+
+        bgl_ = font_->bindGroupLayout();
+        wgpu::PipelineLayoutDescriptor pld{};
+        pld.bindGroupLayoutCount = 1;
+        pld.bindGroupLayouts = &bgl_;
+        pl_ = device_.CreatePipelineLayout(&pld);
+        ready_ = true;
+    }
+
+    void draw(Surface& target, glm::ivec2 pos, const std::string& text, glm::vec4 color) {
+        if (!target.isValid() || text.empty()) return;
+        ensure(target.device());
+
+        std::vector<Vertex> verts = font_->buildQuads(text, static_cast<float>(pos.x),
+                                                       static_cast<float>(pos.y), color, 1.0f);
+        if (verts.empty()) return;
+
+        // BitmapFont gives pixel-space positions; the UI surface is drawn in NDC.
+        const float w = static_cast<float>(target.width());
+        const float h = static_cast<float>(target.height());
+        for (Vertex& v : verts) {
+            v.position.x = v.position.x / w * 2.0f - 1.0f;
+            v.position.y = 1.0f - v.position.y / h * 2.0f;
+        }
+
+        const size_t vboSize = verts.size() * sizeof(Vertex);
+        wgpu::BufferDescriptor bd{};
+        bd.size = vboSize;
+        bd.usage = wgpu::BufferUsage::Vertex | wgpu::BufferUsage::CopyDst;
+        wgpu::Buffer vbo = device_.CreateBuffer(&bd);
+        device_.GetQueue().WriteBuffer(vbo, 0, verts.data(), vboSize);
+
+        wgpu::CommandEncoder enc = device_.CreateCommandEncoder();
+        wgpu::RenderPassEncoder pass = target.beginLoad(enc);
+        pass.SetPipeline(pipelineFor(target.format()));
+        pass.SetVertexBuffer(0, vbo, 0, vboSize);
+        pass.SetBindGroup(0, font_->bindGroup());
+        pass.Draw(static_cast<uint32_t>(verts.size()));
+        target.end(pass);
+        wgpu::CommandBuffer cmd = enc.Finish();
+        device_.GetQueue().Submit(1, &cmd);
+    }
+
+    glm::vec2 measure(const std::string& text) const {
+        if (!font_ || text.empty()) return {0.0f, 0.0f};
+        return font_->measure(text);
+    }
+
+private:
+    wgpu::RenderPipeline pipelineFor(wgpu::TextureFormat fmt) {
+        for (auto& [f, p] : cache_)
+            if (f == fmt) return p;
+
+        wgpu::ColorTargetState target{};
+        target.format = fmt;
+        target.blend = &Blend::Alpha;
+        target.writeMask = wgpu::ColorWriteMask::All;
+        wgpu::FragmentState frag{};
+        frag.module = module_;
+        frag.entryPoint = "fs";
+        frag.targetCount = 1;
+        frag.targets = &target;
+        wgpu::VertexBufferLayout vbl = Mesh::vertexLayout();
+        wgpu::RenderPipelineDescriptor rpd{};
+        rpd.layout = pl_;
+        rpd.vertex.module = module_;
+        rpd.vertex.entryPoint = "vs";
+        rpd.vertex.bufferCount = 1;
+        rpd.vertex.buffers = &vbl;
+        rpd.fragment = &frag;
+        rpd.primitive.topology = wgpu::PrimitiveTopology::TriangleList;
+        rpd.multisample.count = 1;
+        rpd.multisample.mask = 0xFFFFFFFF;
+        wgpu::RenderPipeline p = device_.CreateRenderPipeline(&rpd);
+        cache_.push_back({fmt, p});
+        return p;
+    }
+
+    bool ready_ = false;
+    wgpu::Device device_;
+    std::unique_ptr<BitmapFont> font_;
+    wgpu::ShaderModule module_;
+    wgpu::BindGroupLayout bgl_;
+    wgpu::PipelineLayout pl_;
+    std::vector<std::pair<wgpu::TextureFormat, wgpu::RenderPipeline>> cache_;
+};
+
+TextRenderer& textRenderer() {
+    static TextRenderer t;
+    return t;
+}
+
 // Splits a layout/preset line into tokens; a "quoted string" is one token
 // (used by label text, the only field allowed to contain spaces).
 std::vector<std::string> tokenizeLine(const std::string& line) {
@@ -191,9 +330,8 @@ std::vector<std::string> tokenizeLine(const std::string& line) {
 
 }  // namespace
 
-void drawText(Surface&, glm::ivec2, const std::string&) {
-    // M1 stub — see md/ui.md §9.2. M2 replaces this with an embedded bitmap
-    // font; every widget already calls this where its text belongs.
+void drawText(Surface& target, glm::ivec2 pos, const std::string& text, glm::vec4 color) {
+    textRenderer().draw(target, pos, text, color);
 }
 
 // ===========================================================================
@@ -211,7 +349,10 @@ Label::Label(std::string text, glm::ivec2 pos_) {
     pos = pos_;
 }
 
-void Label::draw(Surface& s) { drawText(s, pos, label); }
+void Label::draw(Surface& s) {
+    glm::vec4 c = theme ? theme->colorLabel : glm::vec4{1.0f, 1.0f, 1.0f, 1.0f};
+    drawText(s, pos, label, c);
+}
 
 // ===========================================================================
 // Checkbox
@@ -235,7 +376,8 @@ void Checkbox::draw(Surface& s) {
         float inset = box * 0.25f;
         fillRect(s, glm::vec2(pos) + glm::vec2(inset), glm::vec2(box - inset * 2.0f, box - inset * 2.0f), fg);
     }
-    drawText(s, {pos.x + size.y + 8, pos.y + baseline}, label);
+    glm::vec4 labelColor = theme ? theme->colorLabel : glm::vec4{1.0f, 1.0f, 1.0f, 1.0f};
+    drawText(s, {pos.x + size.y + 8, pos.y + baseline}, label, labelColor);
 }
 
 void Checkbox::onMousePress(glm::ivec2) { set(!get()); }
@@ -259,6 +401,7 @@ void FloatSlider::draw(Surface& s) {
     glm::vec4 bg = theme ? theme->colorBg : glm::vec4{0.5f, 0.5f, 0.5f, 1.0f};
     glm::vec4 fg = theme ? theme->colorFg : glm::vec4{0.0f, 0.0f, 0.0f, 1.0f};
     int baseline = theme ? theme->labelBaseline : 5;
+    glm::vec4 labelColor = theme ? theme->colorLabel : glm::vec4{1.0f, 1.0f, 1.0f, 1.0f};
 
     fillRect(s, glm::vec2(pos), glm::vec2(size), bg);
     // Clamp the drawn fraction, but never clamp the bound value itself here —
@@ -266,7 +409,15 @@ void FloatSlider::draw(Surface& s) {
     // pinned-at-the-end, not silently altered.
     float t = (max > min) ? std::clamp((get() - min) / (max - min), 0.0f, 1.0f) : 0.0f;
     fillRect(s, glm::vec2(pos), glm::vec2(static_cast<float>(size.x) * t, static_cast<float>(size.y)), fg);
-    drawText(s, {pos.x + 4, pos.y + baseline}, label);
+
+    textRenderer().ensure(s.device());
+    drawText(s, {pos.x + 4, pos.y + baseline}, label, labelColor);
+
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%.2f", get());
+    std::string valueStr = buf;
+    int valueW = static_cast<int>(textRenderer().measure(valueStr).x);
+    drawText(s, {pos.x + size.x - 4 - valueW, pos.y + baseline}, valueStr, labelColor);
 }
 
 void FloatSlider::onMouseDrag(glm::ivec2 p) {
@@ -297,11 +448,18 @@ void IntSlider::draw(Surface& s) {
     glm::vec4 bg = theme ? theme->colorBg : glm::vec4{0.5f, 0.5f, 0.5f, 1.0f};
     glm::vec4 fg = theme ? theme->colorFg : glm::vec4{0.0f, 0.0f, 0.0f, 1.0f};
     int baseline = theme ? theme->labelBaseline : 5;
+    glm::vec4 labelColor = theme ? theme->colorLabel : glm::vec4{1.0f, 1.0f, 1.0f, 1.0f};
 
     fillRect(s, glm::vec2(pos), glm::vec2(size), bg);
     float t = (max > min) ? std::clamp(static_cast<float>(get() - min) / static_cast<float>(max - min), 0.0f, 1.0f) : 0.0f;
     fillRect(s, glm::vec2(pos), glm::vec2(static_cast<float>(size.x) * t, static_cast<float>(size.y)), fg);
-    drawText(s, {pos.x + 4, pos.y + baseline}, label);
+
+    textRenderer().ensure(s.device());
+    drawText(s, {pos.x + 4, pos.y + baseline}, label, labelColor);
+
+    std::string valueStr = std::to_string(get());
+    int valueW = static_cast<int>(textRenderer().measure(valueStr).x);
+    drawText(s, {pos.x + size.x - 4 - valueW, pos.y + baseline}, valueStr, labelColor);
 }
 
 void IntSlider::onMouseDrag(glm::ivec2 p) {

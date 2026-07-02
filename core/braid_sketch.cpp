@@ -6,6 +6,7 @@
 // addressed by dynamic offset) and replays them as draws.
 #include "braid.h"
 #include "braid_detail.h"
+#include "braid_text.h"
 
 #include <array>
 #include <cmath>
@@ -18,13 +19,18 @@
 namespace braid {
 
 // Default shader: MVP uniform at @group(0) @binding(0), per-vertex color.
+// Textured variant at fsText samples the built-in font atlas at @group(1).
 static const char* kDefaultWGSL = R"WGSL(
 struct Uniforms { mvp : mat4x4<f32>, tint : vec4<f32> };
 @group(0) @binding(0) var<uniform> u : Uniforms;
 
+@group(1) @binding(0) var fontTex : texture_2d<f32>;
+@group(1) @binding(1) var fontSampler : sampler;
+
 struct VSOut {
     @builtin(position) pos : vec4<f32>,
     @location(0) color : vec4<f32>,
+    @location(1) uv : vec2<f32>,
 };
 
 @vertex
@@ -35,12 +41,19 @@ fn vs(@location(0) position : vec3<f32>,
     var o : VSOut;
     o.pos = u.mvp * vec4<f32>(position, 1.0);
     o.color = color * u.tint;
+    o.uv = uv;
     return o;
 }
 
 @fragment
 fn fs(in : VSOut) -> @location(0) vec4<f32> {
     return in.color;
+}
+
+@fragment
+fn fsText(in : VSOut) -> @location(0) vec4<f32> {
+    let a = textureSample(fontTex, fontSampler, in.uv).r;
+    return vec4<f32>(in.color.rgb, in.color.a * a);
 }
 )WGSL";
 
@@ -84,10 +97,20 @@ void SketchApp::ensureReady() {
     bgld.entries = &e;
     sketchBGL_ = device().CreateBindGroupLayout(&bgld);
 
+    // Colored-shape pipeline only needs the uniform bind group.
     wgpu::PipelineLayoutDescriptor pld{};
     pld.bindGroupLayoutCount = 1;
     pld.bindGroupLayouts = &sketchBGL_;
     sketchPL_ = device().CreatePipelineLayout(&pld);
+
+    // Textured-text pipeline adds the font atlas at group 1.
+    font_ = std::make_unique<BitmapFont>(device());
+    fontBGL_ = font_->bindGroupLayout();
+    wgpu::BindGroupLayout textLayouts[2] = {sketchBGL_, fontBGL_};
+    wgpu::PipelineLayoutDescriptor textPld{};
+    textPld.bindGroupLayoutCount = 2;
+    textPld.bindGroupLayouts = textLayouts;
+    sketchTextPL_ = device().CreatePipelineLayout(&textPld);
 
     ready_ = true;
 }
@@ -167,6 +190,7 @@ void SketchApp::drawTris(std::span<const Vertex> verts) {
     c.mvp = proj_ * view_ * transform_.current;
     c.tint = state_.fill;
     c.lines = false;
+    c.textured = false;
     batchVerts_.insert(batchVerts_.end(), verts.begin(), verts.end());
     batchCmds_.push_back(c);
 }
@@ -179,13 +203,16 @@ void SketchApp::drawLines(std::span<const Vertex> verts) {
     c.mvp = proj_ * view_ * transform_.current;
     c.tint = state_.fill;
     c.lines = true;
+    c.textured = false;
     batchVerts_.insert(batchVerts_.end(), verts.begin(), verts.end());
     batchCmds_.push_back(c);
 }
 
-wgpu::RenderPipeline SketchApp::sketchPipeline(wgpu::TextureFormat fmt, bool lines) {
+wgpu::RenderPipeline SketchApp::sketchPipeline(wgpu::TextureFormat fmt, bool lines,
+                                                bool textured) {
     for (auto& sp : sketchPipelines_)
-        if (sp.format == fmt && sp.lines == lines) return sp.pipeline;
+        if (sp.format == fmt && sp.lines == lines && sp.textured == textured)
+            return sp.pipeline;
 
     wgpu::ColorTargetState target{};
     target.format = fmt;
@@ -193,12 +220,12 @@ wgpu::RenderPipeline SketchApp::sketchPipeline(wgpu::TextureFormat fmt, bool lin
     target.writeMask = wgpu::ColorWriteMask::All;
     wgpu::FragmentState frag{};
     frag.module = sketchModule_;
-    frag.entryPoint = "fs";
+    frag.entryPoint = textured ? "fsText" : "fs";
     frag.targetCount = 1;
     frag.targets = &target;
     wgpu::VertexBufferLayout vbl = Mesh::vertexLayout();
     wgpu::RenderPipelineDescriptor desc{};
-    desc.layout = sketchPL_;
+    desc.layout = textured ? sketchTextPL_ : sketchPL_;
     desc.vertex.module = sketchModule_;
     desc.vertex.entryPoint = "vs";
     desc.vertex.bufferCount = 1;
@@ -209,7 +236,7 @@ wgpu::RenderPipeline SketchApp::sketchPipeline(wgpu::TextureFormat fmt, bool lin
     desc.multisample.count = 1;
     desc.multisample.mask = 0xFFFFFFFF;
     wgpu::RenderPipeline p = device().CreateRenderPipeline(&desc);
-    sketchPipelines_.push_back({fmt, lines, p});
+    sketchPipelines_.push_back({fmt, lines, textured, p});
     return p;
 }
 
@@ -255,18 +282,21 @@ void SketchApp::emitBatch() {
     }
     device().GetQueue().WriteBuffer(ubo_, 0, staging.data(), staging.size());
 
-    // 3) Replay: one pass, pipeline switched only when topology changes.
+    // 3) Replay: one pass, pipeline switched only when topology/texturing changes.
     ensurePass();
     const wgpu::TextureFormat fmt = surface().format();
     WGPURenderPipeline cur = nullptr;
     for (size_t i = 0; i < needSlots; ++i) {
         const DrawCmd& c = batchCmds_[i];
-        wgpu::RenderPipeline p = sketchPipeline(fmt, c.lines);
+        wgpu::RenderPipeline p = sketchPipeline(fmt, c.lines, c.textured);
         if (p.Get() != cur) { currentPass_.SetPipeline(p); cur = p.Get(); }
         currentPass_.SetVertexBuffer(0, vbo_, c.firstVertex * sizeof(Vertex),
                                      c.vertexCount * sizeof(Vertex));
         uint32_t off = static_cast<uint32_t>(i * kUniformStride);
         currentPass_.SetBindGroup(0, uboBindGroup_, 1, &off);
+        if (c.textured) {
+            currentPass_.SetBindGroup(1, font_->bindGroup(), 0, nullptr);
+        }
         currentPass_.Draw(c.vertexCount);
     }
     batchVerts_.clear();
@@ -395,6 +425,31 @@ void SketchApp::submitFrame() {
     emitBatch();  // upload + record any primitives drawn so far this frame
     flush();      // close the pass so its commands are legal to submit
     App::submitFrame();
+}
+
+SketchApp::~SketchApp() = default;
+
+void SketchApp::text(float x, float y, std::string_view s) {
+    ensureReady();
+    if (!state_.fillEnabled || !font_ || s.empty()) return;
+
+    std::vector<Vertex> verts = font_->buildQuads(s, x, y, state_.fill, 1.0f);
+    if (verts.empty()) return;
+
+    DrawCmd c;
+    c.firstVertex = static_cast<uint32_t>(batchVerts_.size());
+    c.vertexCount = static_cast<uint32_t>(verts.size());
+    c.mvp = proj_ * view_ * transform_.current;
+    c.tint = {1.0f, 1.0f, 1.0f, 1.0f};  // per-vertex color already carries fill()
+    c.lines = false;
+    c.textured = true;
+    batchVerts_.insert(batchVerts_.end(), verts.begin(), verts.end());
+    batchCmds_.push_back(c);
+}
+
+glm::vec2 SketchApp::textSize(std::string_view s) const {
+    if (!font_ || s.empty()) return {0.0f, 0.0f};
+    return font_->measure(s);
 }
 
 }  // namespace braid

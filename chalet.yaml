@@ -60,6 +60,7 @@ targets:
         - core/braid_mesh.cpp
         - core/braid_app.cpp
         - core/braid_sketch.cpp
+        - core/braid_text.cpp
 
   # First addon: image file I/O. Defines Surface::load / Surface::save against the
   # mango decode/encode stack. Only targets that need image I/O link this (and the

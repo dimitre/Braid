@@ -140,10 +140,9 @@ public:
     std::string toString() const override;
 };
 
-// M1: empty stub. Every widget already calls this where its text belongs, so
-// M2 replaces the body with an embedded bitmap font and every widget lights
-// up label/value text at once — see md/ui.md §9.2.
-void drawText(Surface&, glm::ivec2, const std::string&);
+// Draw a bitmap-text label into a UI surface. Tint defaults to white so labels
+// can use it as-is; widgets pass their theme foreground color.
+void drawText(Surface&, glm::ivec2, const std::string&, glm::vec4 color = {1, 1, 1, 1});
 
 // ---------------------------------------------------------------------------
 // TinyUI — the addon. Loads a layout file, renders every frame into its own

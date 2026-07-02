@@ -22,6 +22,7 @@
 #include <queue>
 #include <span>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <vector>
 
@@ -519,6 +520,8 @@ private:
     std::vector<uint32_t> cpuIndices_;
 };
 
+class BitmapFont;  // forward — built-in bitmap font helper
+
 // ---------------------------------------------------------------------------
 // Monitors — physical display geometry, in the shared virtual-desktop coordinate
 // space (same space RGFW/Cocoa report window positions in). A port of the
@@ -812,6 +815,7 @@ public:
     explicit SketchApp(const Settings& settings);
     // For use as a secondary window (borrows an existing Application).
     SketchApp(Application& app, const Settings& settings);
+    ~SketchApp() override;
 
     // Color / style state (client-side until a primitive is drawn).
     void background(float r, float g, float b, float a = 1.0f);
@@ -851,6 +855,10 @@ public:
     void circle(float x, float y, float r);
     void line(float x1, float y1, float x2, float y2);
     void point(float x, float y);
+
+    // Bitmap text (built-in Cherry 13-r font; tinted by current fill color).
+    void text(float x, float y, std::string_view s);
+    glm::vec2 textSize(std::string_view s) const;
 
     // 3D wireframe (lines via the default shader; needs a perspective camera).
     void box(float size);                  // wireframe cube (glutWireCube-style)
@@ -903,22 +911,28 @@ private:
         uint32_t firstVertex = 0, vertexCount = 0;
         glm::mat4 mvp{1.0f};
         glm::vec4 tint{1.0f};
-        bool lines = false;  // LineList vs TriangleList
+        bool lines = false;      // LineList vs TriangleList
+        bool textured = false;   // uses the font atlas pipeline
     };
     struct SketchPipeline {
         wgpu::TextureFormat format;
         bool lines;
+        bool textured;
         wgpu::RenderPipeline pipeline;
     };
     std::vector<Vertex> batchVerts_;
     std::vector<DrawCmd> batchCmds_;
     wgpu::ShaderModule sketchModule_;
     wgpu::BindGroupLayout sketchBGL_;   // binding 0 = uniform w/ dynamic offset
-    wgpu::PipelineLayout sketchPL_;
+    wgpu::PipelineLayout sketchPL_;     // colored shapes: only group 0
+    wgpu::PipelineLayout sketchTextPL_; // textured text: group 0 + font group 1
     std::vector<SketchPipeline> sketchPipelines_;
     wgpu::Buffer vbo_;  size_t vboCapacity_ = 0;  // capacity in vertices
     wgpu::Buffer ubo_;  size_t uboCapacity_ = 0;  // capacity in uniform slots
     wgpu::BindGroup uboBindGroup_;
+
+    std::unique_ptr<BitmapFont> font_;   // lazy-initialized in ensureReady()
+    wgpu::BindGroupLayout fontBGL_;      // group 1 = font texture + sampler
 
     void drawTris(std::span<const Vertex> verts);   // append a TriangleList cmd
     void drawLines(std::span<const Vertex> verts);  // append a LineList cmd
@@ -930,7 +944,7 @@ private:
     // already uses for a single segment. closed=true also strokes the last→first edge.
     void strokeOutline(std::span<const glm::vec2> pts, bool closed);
     void emitBatch();                               // upload + replay into the pass
-    wgpu::RenderPipeline sketchPipeline(wgpu::TextureFormat fmt, bool lines);
+    wgpu::RenderPipeline sketchPipeline(wgpu::TextureFormat fmt, bool lines, bool textured);
     void ensurePass();
 };
 
