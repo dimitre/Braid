@@ -65,17 +65,24 @@ public:
                        wgpu::TextureFormat destFormat, wgpu::TextureView src, float level,
                        float knee);
 
+    // Isoline/edge pass (ported from ofworks contour2.frag) — see Surface::contour.
+    void contourPass(wgpu::CommandEncoder& enc, wgpu::TextureView dest,
+                     wgpu::TextureFormat destFormat, wgpu::TextureView src, glm::vec2 texelSize,
+                     float level, float radius, int mode);
+
 private:
     wgpu::RenderPipeline pipelineFor(wgpu::TextureFormat fmt, const wgpu::BlendState& blend);
     wgpu::RenderPipeline quadPipelineFor(wgpu::TextureFormat fmt, const wgpu::BlendState& blend);
     wgpu::RenderPipeline blurPipelineFor(wgpu::TextureFormat fmt);
     wgpu::RenderPipeline thresholdPipelineFor(wgpu::TextureFormat fmt);
+    wgpu::RenderPipeline contourPipelineFor(wgpu::TextureFormat fmt);
 
     wgpu::Device device_;
     wgpu::ShaderModule module_;
     wgpu::ShaderModule quadModule_;
     wgpu::ShaderModule blurModule_;
     wgpu::ShaderModule thresholdModule_;
+    wgpu::ShaderModule contourModule_;
     wgpu::Sampler sampler_;
     wgpu::BindGroupLayout bgl_;
     wgpu::PipelineLayout pl_;
@@ -85,6 +92,7 @@ private:
     std::vector<std::tuple<wgpu::TextureFormat, const void*, wgpu::RenderPipeline>> quadCache_;
     std::vector<std::pair<wgpu::TextureFormat, wgpu::RenderPipeline>> blurCache_;
     std::vector<std::pair<wgpu::TextureFormat, wgpu::RenderPipeline>> thresholdCache_;
+    std::vector<std::pair<wgpu::TextureFormat, wgpu::RenderPipeline>> contourCache_;
     bool ready_ = false;
 };
 

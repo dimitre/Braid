@@ -343,6 +343,12 @@ public:
     Surface& threshold(float level = 1.0f, float knee = 0.1f);
     // bloom = clone → threshold → blur(4*passes px) → additive composite back.
     Surface& bloom(float threshold = 1.0f, float intensity = 1.0f, int passes = 5);
+    // Isoline/edge detector (ported from ofworks contour2.frag): per pixel, samples
+    // `mode`'s neighbor pattern at `radius` px (0: 8-neighbor +/X, 1: + only,
+    // 2: X only, 3: 2-point) and draws white where the count of neighbors below
+    // luma `level` crosses that pattern's cutoff — a binary contour line at the
+    // level set, not a flat mask like threshold(). Replaces contents (like blur/threshold).
+    Surface& contour(float level = 0.5f, float radius = 1.0f, int mode = 0);
 
     Surface& clear(glm::vec4 c = {0, 0, 0, 1});
 
@@ -514,6 +520,27 @@ private:
 };
 
 // ---------------------------------------------------------------------------
+// Monitors — physical display geometry, in the shared virtual-desktop coordinate
+// space (same space RGFW/Cocoa report window positions in). A port of the
+// monitor-rect bookkeeping openFrameworks' ofAppGLFWWindow does by hand for
+// multi-monitor spanning (ofMonitors::getRectFromMonitors), backed by RGFW's
+// monitor API instead of GLFW's.
+// ---------------------------------------------------------------------------
+struct MonitorRect {
+    int x = 0, y = 0, width = 0, height = 0;
+};
+
+namespace Monitors {
+// All connected monitors, in RGFW's enumeration order (index N here is what
+// AppSettings::monitors calls monitor N).
+std::vector<MonitorRect> list();
+// Bounding rect (union) of the given monitor indices — the rect a single
+// borderless window must cover to visually span exactly those screens.
+// Out-of-range indices are skipped; an empty/all-invalid input returns {0,0,0,0}.
+MonitorRect unionOf(std::span<const int> indices);
+}  // namespace Monitors
+
+// ---------------------------------------------------------------------------
 // App settings — extracted so Window (the base class) can use them before App
 // is fully declared.
 // ---------------------------------------------------------------------------
@@ -523,13 +550,58 @@ struct AppSettings {
     const char* title = "Braid";
     bool resizable = true;
     bool vsync = true;
+    // Native-res rendering by default (md/hidpi.md §2). false is a performance
+    // hatch, not a mode: the swapchain stays at physical pixels; only mainSurface_
+    // shrinks to point size, and endFrame()'s blit does the upscale inside Braid
+    // (never Core Animation). Sketches and addons must not branch on this — the
+    // point-space API is identical either way.
+    bool hidpi = true;
     wgpu::TextureFormat format = wgpu::TextureFormat::BGRA8Unorm;
+    // Frame pacing is process-wide (one shared run loop drives every window), so
+    // only the primary window's targetFps has any effect in v1 — a secondary's
+    // targetFps is not read. Per-window vsync *is* independent (see below).
     int targetFps = 60;
 #ifdef NDEBUG
     bool enableValidation = false;  // Fix 8 — off in release
 #else
     bool enableValidation = true;   // Fix 8 — on in debug
 #endif
+
+    // Explicit top-left position (virtual-desktop coords). Unset = auto-placed:
+    // the primary centers on its monitor; secondaries default to the next
+    // connected monitor (or cascade if there isn't one) — see Window::create().
+    std::optional<glm::ivec2> position;
+    // Span these monitor indices (from Monitors::list()) as one borderless
+    // window covering their union rect. Overrides width/height/position and
+    // implies a frameless window — the openFrameworks `fullscreenDisplays`
+    // pattern, e.g. {2, 3, 4, 5} for four adjacent outputs.
+    std::vector<int> monitors;
+};
+
+// ---------------------------------------------------------------------------
+// Addon — window-scoped, stateful extension (UI, MIDI, OSC, ...). Addons need a
+// surface and mouse coordinates, so they live on a Window, not on App (see
+// braid_roadmap.md §1). Kept deliberately minimal: lifecycle hooks and an
+// optional overlay layer. No ordering knob — addons run in registration order,
+// and "must see the finished frame" is expressed by the afterDraw phase, not by
+// out-numbering the other addons.
+// ---------------------------------------------------------------------------
+class Window; // forward — Addon hooks take Window&, defined below
+
+class Addon {
+public:
+    virtual ~Addon() = default;
+    virtual void setup(Window&) {}
+    virtual void update(Window&) {}
+    virtual void draw(Window&) {}
+
+    // Runs after the sketch AND every addon's draw() — the frame is final.
+    // Readers of the finished frame (recorders, publishers) belong here.
+    virtual void afterDraw(Window&) {}
+
+    // Optional overlay layer, blitted over the swapchain at present time (after
+    // the mainSurface_ blit) with Blend::Alpha. nullptr = no overlay.
+    virtual Surface* overlay() { return nullptr; }
 };
 
 // ---------------------------------------------------------------------------
@@ -592,6 +664,17 @@ public:
 
     int width() const;
     int height() const;
+
+    // HiDPI law (md/hidpi.md §1): Window speaks logical points — width()/height(),
+    // mousePos(), sketch draw coordinates. Surface speaks real pixels. pixelRatio()
+    // is this window's backing scale (1.0 or 2.0 on macOS), re-queried by core on
+    // every scale event; pixelWidth()/pixelHeight() = logical size × pixelRatio,
+    // the drawable's physical size. These are reads for physical sizing — never
+    // units the sketch must convert with.
+    float pixelRatio() const;
+    int pixelWidth() const;
+    int pixelHeight() const;
+
     glm::vec2 mousePos() const;
     float mouseX() const;
     float mouseY() const;
@@ -602,6 +685,15 @@ public:
 
     // ofSetWindowTitle-style. Cheap; safe to call every frame (throttle for taste).
     void setWindowTitle(const char* title);
+
+    // Registers an addon on this window. Sketch-owned addons (the common case —
+    // a member field alongside the sketch) use the non-owning overload; the
+    // sketch must outlive the Window, which holds for the usual "sketch IS the
+    // Window" pattern. Heap-owned addons use the shared_ptr overload. Either
+    // way, addon hooks run in registration order after the window's own hooks
+    // each frame — see Application::run()/drawWindow() and endFrame().
+    void addAddon(Addon& addon);
+    void addAddon(std::shared_ptr<Addon> addon);
 
     // Pull-first event streams (Fix 2). Immobile; held by reference.
     Channel<KeyEvent> keyEvents;
@@ -619,9 +711,18 @@ protected:
     void initSurface(wgpu::Surface surface);
     void configureSurface();
     void createSwapAndMainSurfaces();
-    void pumpQueued();
+    void adoptMetalLayer(void* layer);   // store + set contentsScale = pixelRatio_
+    void resizeSurfacesToWindow();       // swapchain at pixels; mainSurface_ per hidpi flag
     bool beginFrame();
     void endFrame();
+
+    void processEvent(const void* rgfwEvent);  // opaque RGFW_event*
+    void drainChannels();
+
+    // Releases the RGFW window and GPU-side surfaces without destroying this
+    // Window object. Idempotent. Used both by ~Window and by Application::run()
+    // to let the primary window close early while secondaries keep running.
+    void closeNative();
 
     void* nativeWindow() const;
     const AppSettings& settings() const;
@@ -631,6 +732,10 @@ protected:
     Application& app_;
     AppSettings settings_;
     glm::vec2 mousePos_{0.0f};
+    // Backing scale, re-queried from NSWindow on every RGFW_scaleUpdated (never
+    // accumulated, never taken from the event payload — md/hidpi.md §4).
+    float pixelRatio_ = 1.0f;
+    void* metalLayer_ = nullptr;  // CAMetalLayer*; kept to re-hint contentsScale on scale changes
 
     void* window_ = nullptr;  // RGFW_window*
     bool running_ = false;
@@ -639,6 +744,15 @@ protected:
     wgpu::Surface surface_;
     std::optional<Surface> swapSurface_;   // wraps the swapchain (present target)
     std::optional<Surface> mainSurface_;   // persistent offscreen — draw target
+
+    // Addons, dispatched in registration order. addons_
+    // holds every addon (owning or not) for dispatch; ownedAddons_ only keeps
+    // the shared_ptr overload's addons alive. Window never calls into addons_
+    // during teardown (closeNative()/~Window()), so a sketch-owned addon that is
+    // destroyed before this base Window (the common "sketch IS the Window" case)
+    // is safe.
+    std::vector<Addon*> addons_;
+    std::vector<std::shared_ptr<Addon>> ownedAddons_;
 
     // Per-frame state, valid only between beginFrame/endFrame.
     wgpu::CommandEncoder frameEncoder_;
@@ -674,10 +788,10 @@ public:
         return ref;
     }
 
-protected:
     // For subclasses that are used as secondary windows (they borrow an existing Application).
     App(Application& app, const Settings& settings);
 
+protected:
     void adoptSecondary(std::unique_ptr<Window> w);
 
 private:
@@ -696,11 +810,9 @@ class SketchApp : public App {
 public:
     SketchApp();
     explicit SketchApp(const Settings& settings);
-protected:
     // For use as a secondary window (borrows an existing Application).
     SketchApp(Application& app, const Settings& settings);
 
-public:
     // Color / style state (client-side until a primitive is drawn).
     void background(float r, float g, float b, float a = 1.0f);
     void background(glm::vec4 color);

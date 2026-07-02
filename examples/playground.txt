@@ -1,0 +1,12 @@
+# playground.cpp — live feedback/contour controls
+label  "Feedback / Contour"
+float  gain           0 1 0.89
+float  zoom           0.8 1.4 1.13
+float  rotate         -0.02 0.02 0.0016
+bool   contour        1
+float  contourLevel   0 1 0.5
+float  contourRadius  0.2 6 1.5
+int    contourMode    0 3 0
+bool   invert         0
+int    count          1 60 30
+float  sizeScale      0.5 5 2.0

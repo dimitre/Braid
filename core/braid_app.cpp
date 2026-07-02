@@ -12,7 +12,9 @@
 #include "braid_compositor.h"
 #include "braid_detail.h"
 
+#include <algorithm>
 #include <string>
+#include <unordered_map>
 #include <vector>
 #include <memory>
 
@@ -103,6 +105,65 @@ static char printableChar(RGFW_key v) {
     return (v >= 32 && v < 127) ? static_cast<char>(v) : 0;
 }
 
+// RGFW is a process-wide singleton (see braid_multiwindow.md §1): init is safe
+// to call more than once as long as every call is idempotent. Application::
+// ensureInitialized() is the "real" owner (it pairs this with RGFW_deinit()),
+// but Monitors::list() must also work *before* any window exists — e.g. to
+// decide AppSettings::monitors for the very first window being created — so
+// both funnel through this shared, idempotent guard instead of each calling
+// RGFW_init() directly.
+static void ensureRGFWReady() {
+    static bool inited = false;
+    if (!inited) {
+        RGFW_init("braid", (RGFW_initFlags)0);
+        inited = true;
+    }
+}
+
+// ===========================================================================
+// Monitors — see braid.h. RGFW_getMonitors returns pointers into RGFW's own
+// monitor list (only the outer array we get back is ours to free).
+// ===========================================================================
+namespace Monitors {
+
+std::vector<MonitorRect> list() {
+    ensureRGFWReady();
+    std::vector<MonitorRect> out;
+    size_t count = 0;
+    RGFW_monitor** mons = RGFW_getMonitors(&count);
+    if (!mons) return out;
+    out.reserve(count);
+    for (size_t i = 0; i < count; ++i) {
+        RGFW_monitor* m = mons[i];
+        out.push_back({m->x, m->y, m->mode.w, m->mode.h});
+    }
+    RGFW_FREE(mons);
+    return out;
+}
+
+MonitorRect unionOf(std::span<const int> indices) {
+    std::vector<MonitorRect> mons = list();
+    MonitorRect r{};
+    bool first = true;
+    for (int i : indices) {
+        if (i < 0 || static_cast<size_t>(i) >= mons.size()) continue;
+        const MonitorRect& m = mons[static_cast<size_t>(i)];
+        if (first) {
+            r = m;
+            first = false;
+            continue;
+        }
+        int left = std::min(r.x, m.x);
+        int top = std::min(r.y, m.y);
+        int right = std::max(r.x + r.width, m.x + m.width);
+        int bottom = std::max(r.y + r.height, m.y + m.height);
+        r = {left, top, right - left, bottom - top};
+    }
+    return r;
+}
+
+}  // namespace Monitors
+
 // ===========================================================================
 // Forward declarations (defined later in this TU)
 // ===========================================================================
@@ -142,7 +203,7 @@ Result<std::unique_ptr<DeviceContext>> DeviceContext::create(void* metalLayer,
     return Result<std::unique_ptr<DeviceContext>>::success(std::move(ctx));
 }
 
-Result<void> DeviceContext::init(void* metalLayer, const AppSettings& settings) {
+Result<void> DeviceContext::init(void* metalLayer, [[maybe_unused]] const AppSettings& settings) {
     wgpu::InstanceDescriptor instDesc{};
     instance_ = wgpu::CreateInstance(&instDesc);
     if (!instance_) return Result<void>::failure("wgpu::CreateInstance failed");
@@ -209,6 +270,7 @@ class Application {
 public:
     Application() = default;
     ~Application() {
+        windowMap_.clear();
         // Destroy secondary windows (and their surfaces) before the device.
         secondaries_.clear();
         ctx_.reset();
@@ -224,7 +286,7 @@ public:
         if (initialized_) return Result<void>::success();
         if (!primary_) return Result<void>::failure("no primary window");
 
-        RGFW_init("braid", (RGFW_initFlags)0);
+        ensureRGFWReady();
         rgfwInit_ = true;
 
         if (auto r = primary_->create(); !r) return r;
@@ -239,6 +301,7 @@ public:
         primary_->initSurface(ctx_->takeSurface());
         primary_->configureSurface();
         primary_->createSwapAndMainSurfaces();
+        windowMap_[static_cast<RGFW_window*>(primary_->nativeWindow())] = primary_;
 
         timer_.setFps(primary_->settings().targetFps);
         initialized_ = true;
@@ -250,6 +313,26 @@ public:
             fmt::print(stderr, "[braid] createWindow failed: {}\n", r.error);
             std::abort();
         }
+
+        // A secondary with no explicit position/monitors would otherwise land
+        // centered on the same screen as the primary, directly overlapping it.
+        // Default it onto the next connected monitor (typical rig: primary on
+        // the laptop panel, secondaries on external displays); fall back to a
+        // simple cascade if there isn't one.
+        if (w->settings_.monitors.empty() && !w->settings_.position) {
+            std::vector<MonitorRect> mons = Monitors::list();
+            size_t idx = secondaries_.size() + 1;  // monitor 0 is presumed the primary's
+            if (idx < mons.size()) {
+                const MonitorRect& m = mons[idx];
+                w->settings_.position = glm::ivec2{
+                    m.x + (m.width - w->settings_.width) / 2,
+                    m.y + (m.height - w->settings_.height) / 2};
+            } else {
+                int n = static_cast<int>(secondaries_.size());
+                w->settings_.position = glm::ivec2{120 + n * 48, 120 + n * 48};
+            }
+        }
+
         if (auto r = w->create(); !r) {
             fmt::print(stderr, "[braid] createWindow failed: {}\n", r.error);
             std::abort();
@@ -271,7 +354,9 @@ public:
         w->initSurface(std::move(surface));
         w->configureSurface();
         w->createSwapAndMainSurfaces();
+        Window* ptr = w.get();
         secondaries_.push_back(std::move(w));
+        windowMap_[static_cast<RGFW_window*>(ptr->nativeWindow())] = ptr;
     }
 
     Result<void> run() {
@@ -281,6 +366,7 @@ public:
         timer_.reset();
         if (primary_ && !primary_->setupDone_) {
             primary_->setup();
+            for (Addon* a : primary_->addons_) a->setup(*primary_);
             primary_->setupDone_ = true;
         }
 
@@ -288,23 +374,54 @@ public:
             timer_.waitNext();
             RGFW_pollEvents();
 
-            if (primary_) primary_->pumpQueued();
-            for (auto& w : secondaries_) w->pumpQueued();
-
-            if (primary_ && primary_->shouldClose()) running_ = false;
-            for (auto it = secondaries_.begin(); it != secondaries_.end(); ) {
-                if ((*it)->shouldClose()) it = secondaries_.erase(it);
-                else ++it;
+            // Drain the shared RGFW queue once, then dispatch each event to the
+            // correct window by its RGFW_window*. This avoids the event-loss bug in
+            // RGFW_window_checkQueuedEvent when it scans past non-matching events.
+            std::vector<RGFW_event> events;
+            RGFW_event ev;
+            while (RGFW_checkQueuedEvent(&ev)) {
+                events.push_back(ev);
             }
-            if (!primary_ && secondaries_.empty()) running_ = false;
+            for (const auto& e : events) {
+                if (e.common.win == nullptr) continue;
+                auto it = windowMap_.find(e.common.win);
+                if (it != windowMap_.end()) it->second->processEvent(&e);
+            }
+
+            if (primary_ && !primaryClosed_) primary_->drainChannels();
+            for (auto& w : secondaries_) w->drainChannels();
+
+            // Any window — primary or secondary — can close independently; the
+            // app only ends once none are left. The primary's C++ object is
+            // caller-owned (typically the App on main()'s stack), so it can't be
+            // erased like a secondary: release its native window/surfaces via
+            // closeNative() and just stop touching it.
+            if (primary_ && !primaryClosed_ && primary_->shouldClose()) {
+                windowMap_.erase(static_cast<RGFW_window*>(primary_->nativeWindow()));
+                primary_->exit();
+                primary_->closeNative();
+                primaryClosed_ = true;
+            }
+            for (auto it = secondaries_.begin(); it != secondaries_.end(); ) {
+                if ((*it)->shouldClose()) {
+                    windowMap_.erase(static_cast<RGFW_window*>((*it)->nativeWindow()));
+                    (*it)->exit();
+                    it = secondaries_.erase(it);
+                } else ++it;
+            }
+
+            bool anyOpen = (primary_ && !primaryClosed_) || !secondaries_.empty();
+            if (!anyOpen) running_ = false;
 
             if (running_) {
-                if (primary_) {
+                if (primary_ && !primaryClosed_) {
                     primary_->update();
+                    for (Addon* a : primary_->addons_) a->update(*primary_);
                     drawWindow(*primary_);
                 }
                 for (auto& w : secondaries_) {
                     w->update();
+                    for (Addon* a : w->addons_) a->update(*w);
                     drawWindow(*w);
                 }
             }
@@ -312,7 +429,7 @@ public:
             if (ctx_) ctx_->instance().ProcessEvents();
         }
 
-        if (primary_) primary_->exit();
+        if (primary_ && !primaryClosed_) primary_->exit();
         return Result<void>::success();
     }
 
@@ -328,12 +445,15 @@ private:
         if (w.shouldClose()) return;
         if (!w.setupDone_) {
             w.setup();
+            for (Addon* a : w.addons_) a->setup(w);
             w.setupDone_ = true;
         }
         if (w.beginFrame()) {
             w.beforeDraw();
             w.draw();
             w.afterDraw();
+            for (Addon* a : w.addons_) a->draw(w);
+            for (Addon* a : w.addons_) a->afterDraw(w);
             w.endFrame();
         }
     }
@@ -341,8 +461,10 @@ private:
     bool rgfwInit_ = false;
     bool initialized_ = false;
     bool running_ = false;
+    bool primaryClosed_ = false;
     Window* primary_ = nullptr;
     std::vector<std::unique_ptr<Window>> secondaries_;
+    std::unordered_map<RGFW_window*, Window*> windowMap_;
     std::unique_ptr<DeviceContext> ctx_;
     Timer timer_;
 };
@@ -353,19 +475,49 @@ private:
 Window::Window(Application& app, const AppSettings& settings)
     : app_(app), settings_(settings) {}
 
-Window::~Window() {
-    if (window_) {
-        RGFW_window_close(static_cast<RGFW_window*>(window_));
-    }
-}
+Window::~Window() { closeNative(); }
 
 Result<void> Window::create() {
-    RGFW_windowFlags flags = RGFW_windowCenter | RGFW_windowFocus | RGFW_windowFocusOnShow;
+    RGFW_windowFlags flags = RGFW_windowFocus | RGFW_windowFocusOnShow;
     if (!settings_.resizable) flags |= RGFW_windowNoResize;
-    RGFW_window* win = RGFW_createWindow(settings_.title, 0, 0, settings_.width, settings_.height,
-                                         flags);
+
+    int x = 0, y = 0;
+    int w = settings_.width, h = settings_.height;
+
+    if (!settings_.monitors.empty()) {
+        // Span the union of the requested monitors as one borderless window —
+        // the openFrameworks `fullscreenDisplays` pattern.
+        MonitorRect r = Monitors::unionOf(settings_.monitors);
+        if (r.width > 0 && r.height > 0) {
+            x = r.x;
+            y = r.y;
+            w = r.width;
+            h = r.height;
+            settings_.width = w;
+            settings_.height = h;
+            flags |= RGFW_windowNoBorder;
+        } else {
+            flags |= RGFW_windowCenter;  // requested monitors don't exist; fall back
+        }
+    } else if (settings_.position) {
+        x = settings_.position->x;
+        y = settings_.position->y;
+    } else {
+        flags |= RGFW_windowCenter;
+    }
+
+    RGFW_window* win = RGFW_createWindow(settings_.title, x, y, w, h, flags);
     if (!win) return Result<void>::failure("RGFW_createWindow failed");
     window_ = win;
+    // The OS can silently clamp the actual window (e.g. a requested height taller
+    // than the screen's usable area) without RGFW telling us via a resize event —
+    // win->w/win->h already reflect the real, possibly-clamped result right after
+    // creation. Reconcile settings_ to match *before* the swapchain is configured
+    // from it, otherwise the swapchain/mainSurface_ get sized for the requested
+    // (wrong) canvas while the real Metal layer is smaller, and the whole frame
+    // renders squeezed/distorted to fit.
+    settings_.width = win->w;
+    settings_.height = win->h;
     mousePos_ = {settings_.width * 0.5f, settings_.height * 0.5f};
     RGFW_window_setExitKey(win, RGFW_keyEscape);
     RGFW_window_show(win);
@@ -373,6 +525,20 @@ Result<void> Window::create() {
     RGFW_window_focus(win);
     running_ = true;
     return Result<void>::success();
+}
+
+void Window::closeNative() {
+    if (window_) {
+        RGFW_window_close(static_cast<RGFW_window*>(window_));
+        window_ = nullptr;
+    }
+    // Release GPU-side surfaces here (rather than letting them fall out as base-class
+    // members, which — for the primary window, whose Application is a *derived*
+    // member of App — would otherwise be destroyed after the device itself).
+    swapSurface_.reset();
+    mainSurface_.reset();
+    surface_ = nullptr;
+    running_ = false;
 }
 
 void Window::initSurface(wgpu::Surface surface) { surface_ = std::move(surface); }
@@ -398,89 +564,89 @@ void Window::createSwapAndMainSurfaces() {
     mainSurface_->clear({0, 0, 0, 1});
 }
 
-void Window::pumpQueued() {
-    auto* win = static_cast<RGFW_window*>(window_);
-    RGFW_event ev;
-    while (RGFW_window_checkQueuedEvent(win, &ev)) {
-        switch (ev.type) {
-            case RGFW_keyPressed: {
-                KeyEvent e{};
-                e.key = mapKey(ev.key.value);
-                e.ch = printableChar(ev.key.value);
-                e.pressed = true;
-                e.repeat = ev.key.repeat != 0;
-                e.shift = (ev.key.mod & RGFW_modShift) != 0;
-                e.ctrl = (ev.key.mod & RGFW_modControl) != 0;
-                e.alt = (ev.key.mod & RGFW_modAlt) != 0;
-                e.super = (ev.key.mod & RGFW_modSuper) != 0;
-                if (e.super && e.key == Key::Q) running_ = false;
-                keyEvents.push(e);
-                keyPressed(e);
-                break;
-            }
-            case RGFW_keyReleased: {
-                KeyEvent e{};
-                e.key = mapKey(ev.key.value);
-                e.ch = printableChar(ev.key.value);
-                e.shift = (ev.key.mod & RGFW_modShift) != 0;
-                e.ctrl = (ev.key.mod & RGFW_modControl) != 0;
-                e.alt = (ev.key.mod & RGFW_modAlt) != 0;
-                e.super = (ev.key.mod & RGFW_modSuper) != 0;
-                keyEvents.push(e);
-                keyReleased(e);
-                break;
-            }
-            case RGFW_mouseButtonPressed: {
-                MouseEvent e{};
-                e.button = mapButton(ev.button.value);
-                e.pos = mousePos_;  // button events carry no position; use latest
-                e.pressed = true;
-                mouseEvents.push(e);
-                mousePressed(e);
-                break;
-            }
-            case RGFW_mouseButtonReleased: {
-                MouseEvent e{};
-                e.button = mapButton(ev.button.value);
-                e.pos = mousePos_;
-                e.pressed = false;
-                mouseEvents.push(e);
-                mouseReleased(e);
-                break;
-            }
-            case RGFW_mouseMotion: {
-                MouseEvent e{};
-                e.pos = {static_cast<float>(ev.mouse.x), static_cast<float>(ev.mouse.y)};
-                e.delta = e.pos - mousePos_;
-                mousePos_ = e.pos;
-                mouseEvents.push(e);
-                mouseMoved(e);
-                break;
-            }
-            case RGFW_mouseScroll: {
-                ScrollEvent e{{ev.delta.x, ev.delta.y}};
-                scrollEvents.push(e);
-                break;
-            }
-            case RGFW_windowResized: {
-                int w = ev.update.w, h = ev.update.h;
-                settings_.width = w;
-                settings_.height = h;
-                configureSurface();
-                if (swapSurface_) swapSurface_->resize(w, h);
-                if (mainSurface_) mainSurface_->resize(w, h);
-                WindowEvent we{WindowEvent::Resized, {static_cast<float>(w), static_cast<float>(h)}};
-                windowEvents.push(we);
-                windowResized(we);
-                break;
-            }
-            case RGFW_windowClose:
-                running_ = false;
-                break;
-            default:
-                break;
+void Window::processEvent(const void* rgfwEvent) {
+    const RGFW_event& ev = *static_cast<const RGFW_event*>(rgfwEvent);
+    switch (ev.type) {
+        case RGFW_keyPressed: {
+            KeyEvent e{};
+            e.key = mapKey(ev.key.value);
+            e.ch = printableChar(ev.key.value);
+            e.pressed = true;
+            e.repeat = ev.key.repeat != 0;
+            e.shift = (ev.key.mod & RGFW_modShift) != 0;
+            e.ctrl = (ev.key.mod & RGFW_modControl) != 0;
+            e.alt = (ev.key.mod & RGFW_modAlt) != 0;
+            e.super = (ev.key.mod & RGFW_modSuper) != 0;
+            if (e.super && e.key == Key::Q) running_ = false;
+            keyEvents.push(e);
+            keyPressed(e);
+            break;
         }
+        case RGFW_keyReleased: {
+            KeyEvent e{};
+            e.key = mapKey(ev.key.value);
+            e.ch = printableChar(ev.key.value);
+            e.shift = (ev.key.mod & RGFW_modShift) != 0;
+            e.ctrl = (ev.key.mod & RGFW_modControl) != 0;
+            e.alt = (ev.key.mod & RGFW_modAlt) != 0;
+            e.super = (ev.key.mod & RGFW_modSuper) != 0;
+            keyEvents.push(e);
+            keyReleased(e);
+            break;
+        }
+        case RGFW_mouseButtonPressed: {
+            MouseEvent e{};
+            e.button = mapButton(ev.button.value);
+            e.pos = mousePos_;  // button events carry no position; use latest
+            e.pressed = true;
+            mouseEvents.push(e);
+            mousePressed(e);
+            break;
+        }
+        case RGFW_mouseButtonReleased: {
+            MouseEvent e{};
+            e.button = mapButton(ev.button.value);
+            e.pos = mousePos_;
+            e.pressed = false;
+            mouseEvents.push(e);
+            mouseReleased(e);
+            break;
+        }
+        case RGFW_mouseMotion: {
+            MouseEvent e{};
+            e.pos = {static_cast<float>(ev.mouse.x), static_cast<float>(ev.mouse.y)};
+            e.delta = e.pos - mousePos_;
+            mousePos_ = e.pos;
+            mouseEvents.push(e);
+            mouseMoved(e);
+            break;
+        }
+        case RGFW_mouseScroll: {
+            ScrollEvent e{{ev.delta.x, ev.delta.y}};
+            scrollEvents.push(e);
+            break;
+        }
+        case RGFW_windowResized: {
+            int w = ev.update.w, h = ev.update.h;
+            settings_.width = w;
+            settings_.height = h;
+            configureSurface();
+            if (swapSurface_) swapSurface_->resize(w, h);
+            if (mainSurface_) mainSurface_->resize(w, h);
+            WindowEvent we{WindowEvent::Resized, {static_cast<float>(w), static_cast<float>(h)}};
+            windowEvents.push(we);
+            windowResized(we);
+            break;
+        }
+        case RGFW_windowClose:
+            running_ = false;
+            break;
+        default:
+            break;
     }
+}
+
+void Window::drainChannels() {
     // Drain channels so subscribed callbacks fire on this (main) thread.
     while (keyEvents.pop()) {}
     while (mouseEvents.pop()) {}
@@ -510,6 +676,15 @@ void Window::endFrame() {
     detail::BlitUniforms u{};
     detail::compositor().blit(frameEncoder_, swapSurface_->asTexture(), settings_.format,
                               mainSurface_->asTexture(), u, Blend::None, wgpu::LoadOp::Clear);
+    // Addon overlays (e.g. TinyUI) land on top, alpha-blended, after the single
+    // mainSurface_ copy — mainSurface_ itself never contains them, so screenshot/
+    // record/feedback stay clean unless a sketch explicitly composites one in.
+    for (Addon* addon : addons_) {
+        if (Surface* ov = addon->overlay()) {
+            detail::compositor().blit(frameEncoder_, swapSurface_->asTexture(), settings_.format,
+                                      ov->asTexture(), u, Blend::Alpha, wgpu::LoadOp::Load);
+        }
+    }
     wgpu::CommandBuffer cmd = frameEncoder_.Finish();
     queue().Submit(1, &cmd);
     surface_.Present();
@@ -521,6 +696,15 @@ void Window::submitFrame() {
     wgpu::CommandBuffer cmd = frameEncoder_.Finish();
     queue().Submit(1, &cmd);
     frameEncoder_ = device().CreateCommandEncoder();
+}
+
+void Window::addAddon(Addon& addon) {
+    addons_.push_back(&addon);
+}
+
+void Window::addAddon(std::shared_ptr<Addon> addon) {
+    addons_.push_back(addon.get());
+    ownedAddons_.push_back(std::move(addon));
 }
 
 void Window::setWindowTitle(const char* title) {
@@ -577,17 +761,20 @@ App::App() : App(Settings{}) {}
 App::App(const Settings& settings) : App(settings, std::make_unique<Application>()) {}
 
 App::App(const Settings& settings, std::unique_ptr<Application> app)
-    : Window(*app, settings), app_(std::move(app)) {}
+    : Window(*app, settings), app_(std::move(app)) {
+    // Register as the primary window now so createWindow() can be called before run().
+    application().setPrimary(this);
+}
 
 App::App(Application& app, const Settings& settings) : Window(app, settings) {}
 
 App::~App() {
-    // Close our RGFW window *before* the Application member is destroyed,
-    // because ~Application calls RGFW_deinit().
-    if (window_) {
-        RGFW_window_close(static_cast<RGFW_window*>(window_));
-        window_ = nullptr;
-    }
+    // Close the window and release its surfaces *before* the app_ member is
+    // destroyed: app_ (Application) is a *derived*-class member, so it would
+    // otherwise be torn down (device included, via ~Application) before this
+    // base Window's own surface members get destroyed. closeNative() is
+    // idempotent, so this is a no-op if Application::run() already closed us.
+    closeNative();
 }
 
 Application& App::application() { return *app_; }

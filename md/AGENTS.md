@@ -16,6 +16,21 @@ Two tiers, one vocabulary:
 - **Explicit tier (`App`)** — raw `Shader` + `Mesh` + render passes. Drop down only
   when you need a custom pipeline.
 
+## Code style
+
+- **Hard tabs, width 4** for all C/C++ source and headers. Zed is configured for this
+  in `.zed/settings.json`; keep it that way.
+- **Never convert existing files to spaces.** When editing a file, match whatever
+  indentation it already uses; for new Braid code, use hard tabs.
+- If you generate a new file or paste code that arrives with spaces, normalize it to
+  hard tabs before finishing:
+
+  ```bash
+  # convert leading spaces to tabs (run from repo root)
+  find core examples addons -name '*.cpp' -o -name '*.h' -o -name '*.hpp' | \
+    xargs -I {} bash -c 'unexpand -t 4 "$1" > "$1.tmp" && mv "$1.tmp" "$1"' _ {}
+  ```
+
 ## Minimal sketch (the skeleton to copy)
 
 ```cpp
@@ -151,6 +166,25 @@ void draw() override {
 
 Gain `< 1.0` = trails fade (replace-ish). Gain `1.0` = pure accumulation.
 
+### Built-in effects (current API; will migrate to pluggable shaders)
+
+These replace the contents of the Surface they are called on:
+
+```cpp
+s.blur(13.0f);                      // separable Gaussian blur, radius in pixels
+s.threshold(1.0f, 0.1f);            // brightpass: keep luma > level (soft knee)
+s.bloom(1.0f, 1.0f, 5);             // threshold -> blur -> additive composite back
+s.contour(0.5f, 1.0f, 0);           // isoline/edge detector (mode 0=8-neighbor +/X)
+```
+
+`paste` and `pasteSelf` draw a source Surface as a placed, rotated quad instead of
+fullscreen:
+
+```cpp
+s.paste(src, {cx, cy}, {w, h}, rotation);  // draw src onto s as a quad
+s.pasteSelf({cx, cy}, {w, h}, 0.02f);      // snapshot s, paste it back over itself
+```
+
 ## Image I/O — the `braid-image` addon
 
 Loading/saving images is an **addon**, not core. The methods are declared on `Surface`
@@ -197,8 +231,9 @@ chalet clean --all
 ```
 
 Targets: `playground` (scratch canvas), `hello` (Tier-1 red triangle), `sketch`,
-`feedback`, `cubes` (3D wireframe), `image` (load/save). In **Zed**, `Cmd+Shift+R`
-runs `playground`; other tasks are in `.zed/tasks.json`.
+`feedback`, `cubes` (3D wireframe), `image` (load/save), `feed`, `bloom`, `contour`,
+`multiwindow`, `syntype_basic`, `syntype_ui`, `syntype_audio`.
+Other tasks are in `.zed/tasks.json`.
 
 ### Adding a new example
 
@@ -223,8 +258,55 @@ Just adding the `.cpp` file is not enough; without a target, `chalet build` won'
 3. If it calls `Surface::load`/`save`, also link `braid-image` **and** the mango
    archives — copy the `image` target's full `staticLinks` list — otherwise those
    symbols are unresolved at link time.
-4. Then `chalet buildrun foo`. (Optional: add a task to `.zed/tasks.json` to run it
-   from the editor.)
+4. Add a task for it in `.zed/tasks.json` so it appears in Zed's task runner.
+5. Then `chalet buildrun foo`.
+
+## App settings
+
+Common `braid::App::Settings` fields:
+
+```cpp
+braid::App::Settings s{};
+s.title = "my sketch";
+s.width = 900;
+s.height = 900;
+s.resizable = true;                 // false for a fixed-size window
+s.vsync = true;                     // false to let targetFps drive pacing
+s.targetFps = 60;                   // 0 = uncapped (still yields to vsync if on)
+s.enableValidation = true;          // WebGPU validation; on in Debug by default
+s.position = {100, 100};            // optional top-left position
+s.monitors = {2, 3, 4, 5};          // span these monitors as one borderless window
+```
+
+Use `Monitors::list()` to query connected displays and `Monitors::unionOf(indices)`
+to get the bounding rect for spanning.
+
+## Multiwindow
+
+`App` can spawn additional windows sharing the same device and run loop:
+
+```cpp
+class Secondary : public braid::SketchApp {
+public:
+    using braid::SketchApp::SketchApp;
+    void draw() override { background(0.1f); circle(100, 100, 40); }
+};
+
+class Primary : public braid::SketchApp {
+public:
+    using braid::SketchApp::SketchApp;
+    void setup() override {
+        braid::App::Settings s2{};
+        s2.title = "secondary";
+        s2.width = 400;
+        s2.height = 400;
+        createWindow<Secondary>(s2);
+    }
+};
+```
+
+The primary window's `targetFps` drives process-wide frame pacing; per-window `vsync`
+is independent. The run loop blocks until the last window closes.
 
 ## Architecture in one line
 

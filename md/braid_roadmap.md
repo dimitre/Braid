@@ -1,6 +1,6 @@
 # Braid — Roadmap
 
-**Updated:** 2026-06-30
+**Updated:** 2026-07-02
 **Now:** v0.1.0 → **v0.2.3 core implemented and verified** (macOS/arm64). Surface is the
 one primitive; algebra + self-feedback work; the ouroboros tunnel was captured to a file.
 **Spirit:** a *fast* creative-coding microframework. Every milestone is a thing you can
@@ -13,53 +13,98 @@ Fresh read of `README.md`, `core/braid.h`, `core/braid.cpp`, `core/braid_image.c
 `chalet.yaml`, and the examples. These are the items that surfaced as live concerns,
 ordered by the user's stated priority.
 
-1. **Multi-window support — *most important now.***
-   The current `App` owns a single `window_`, a single `wgpu::Surface`, and the global
-   `detail::g_ctx`/`detail::g_compositor` are process-wide singletons. This is the
-   architectural blocker for multi-window: every window needs its own RGFW window,
-   swapchain `Surface`, input pump, and ideally its own device context/compositor state.
-   `App` should become a per-window object (or a `Window` handle owned by a shared
-   `Application`), and the global `Context`/`Compositor` should become per-device or
-   per-instance rather than global. This is the foundational refactor that unlocks
-   everything below.
-   - Refactor `detail::Context` from a singleton to an instance owned by the platform
-     layer and passed to Surfaces/Shaders.
-   - Refactor `detail::Compositor` from a singleton to per-device (or per-window)
-     state.
-   - Separate "application lifetime" (instance/adapter/device) from "window lifetime"
-     (RGFW window + swapchain + event pump).
-   - Proof: `examples/multiwindow.cpp` opens two windows, each with its own sketch,
-     each rendering independently at 60fps.
-   - 🟡 **Design done 06-30 → `md/braid_multiwindow.md`** (RGFW multi-window model +
-     WebGPU shared-context analysis, grounded in the RGFW header). Findings: RGFW is
-     multi-window native but its init/deinit are *global* (do them once), and events
-     flow through one shared 32-slot queue that must be drained per-window after a single
-     `RGFW_pollEvents()`; each window gets its own `CAMetalLayer` → own `wgpu::Surface`.
-     "Share context" in WebGPU = **one `Device` for all windows** (there is no per-window
-     context), so today's global `g_ctx`/`g_compositor` already model the shared device
-     *correctly* — the real blocker is that `App` fuses library-init + device + window +
-     loop and `~App` calls `RGFW_deinit()` globally. Recommended path: split app-lifetime
-     from window-lifetime and keep `App` as the first window so no example breaks.
-     **Implementation pending.**
+1. **Multi-window support — implemented; future: output-window simplification.**
+   The original blocker was that `App` fused library-init + device + window + loop.
+   That is now split into `Application` (shared device + global loop) and `Window`
+   (per-window RGFW window + swapchain + surfaces + hooks), with `App` kept as the
+   backward-compatible primary window. Historical design details live in
+   `md/braid_multiwindow.md`; implementation blow-by-blow lives in
+   `md/braid_multiwindow_plan.md`. This roadmap item tracks what is decided and what
+   comes next.
 
-2. **HiDPI / Retina rendering — currently not real, high priority.**
-   Investigated 2026-06-30: RGFW *does* expose the pieces (`monitor.pixelRatio` correctly
-   reads `backingScaleFactor` on macOS, plus `RGFW_window_getSizeInPixels()` and an
-   `RGFW_scaleUpdated` event) but braid never calls any of them.
-   - `RGFW_windowResized` (`core/braid.cpp:1444-1454`) uses `win->w/h` — logical points,
-     not physical pixels — and that logical size is fed straight into the WGPU surface
-     config (`core/braid.cpp:1373-1374`).
-   - `attachMetalLayer()` (`core/braid.cpp:1184-1190`) grabs a bare `CAMetalLayer` and
-     attaches it via `RGFW_window_setLayer_OSX`, which is just `setLayer:` — nothing ever
-     sets `layer.contentsScale`, which defaults to 1.0 regardless of the screen.
-   - Net effect: on a Retina display the swapchain renders at logical (1x) resolution and
-     the compositor upscales it — soft/blurry output, not true HiDPI.
-   - Fix: on window creation and on `RGFW_scaleUpdated`, read the monitor's pixel ratio,
-     set `contentsScale` on the Metal layer, and configure the WGPU surface/`mainSurface_`
-     at `logical_size * pixelRatio`. Keep mouse/input coordinates in logical points (UI
-     space) — only the drawable/backing store needs the pixel size.
-   - Supersedes the parked bullet in v0.1.1 below; do this before it's a live bug on
-     someone's Retina screen.
+   **Done.**
+   - ✅ `Application`/`Window`/`App` split, one shared `wgpu::Device`, global loop with
+     one `RGFW_pollEvents()` per frame and per-window event dispatch. `App` and every
+     existing example continue to compile unchanged.
+   - ✅ `examples/multiwindow.cpp`: primary preview window + secondary output window,
+     independent rendering, clean per-window close, last-window-exits behavior.
+   - ✅ Multi-monitor spanning: `braid::Monitors::list()/unionOf()`,
+     `AppSettings::position` and `AppSettings::monitors`. A secondary can span monitors
+     `{1, 2}` as one borderless native-resolution canvas.
+   - ✅ Review fixes landed: primary close no longer kills secondaries; primary surfaces
+     released before device teardown; secondaries default onto the next monitor instead
+     of stacking on the primary; vendored RGFW.h `RGFW_window_raise` always-on-top bug
+     fixed.
+
+   **Design decisions (locked).**
+   - **One shared `wgpu::Device`.** WebGPU has no per-window context; the device *is*
+     the shared context. This is not changing.
+   - **One global frame pace / target FPS for the whole app.** `Application` owns one
+     `Timer`; only the primary window's `AppSettings::targetFps` is read. Every window
+     advances the same simulation step and draws on the same cadence. Per-window
+     differences are handled by **vsync** (`AppSettings::vsync` / swapchain
+     `PresentMode`) and by frame-skipping inside an individual window's `draw()`, not
+     by independent timers. Rationale: a show has one clock; output windows show the
+     same content, just at different sizes; independent FPS would desync the shared
+     scene or force redundant frame duplication.
+   - **Addons are window-scoped, not app-scoped.** A UI addon registers on the control
+     window it belongs to; output windows stay addon-free. This keeps the architecture
+     honest (addons need a surface + mouse coordinates) while still allowing the user's
+     “one brain, many dumb displays” usage pattern.
+
+   **Future changes / follow-up.**
+   - [ ] **Dumb output window / `DisplayWindow` abstraction.** For install rigs the
+     common pattern is one interactive control window + N non-interactive output
+     windows that just composite a shared `Surface`. Today every secondary must
+     subclass `Window`/`SketchApp` and override `draw()`, which is ceremony for a
+     display-only role. Add a lightweight output-window type — either a base class
+     or an `App::createDisplay(settings, surface)` helper — that owns no UI hooks,
+     no event channels, and simply shows a given `Surface` each frame. Keep `Window`
+     as the foundation; this is a convenience layer for the "projection / LED"
+     secondaries. Important but **not in this session** — note only.
+   - [ ] **Physical multi-monitor spanning test.** Verified on a single-monitor machine
+     only; real spanning across two physical side-by-side displays has never been
+     tested. When the two-output rig is connected: confirm the startup monitor log
+     maps indices `{1, 2}` to the expected physical screens (enumeration order isn't
+     stable across reconnects — adjust `examples/multiwindow.cpp` if needed), confirm
+     the output window is genuinely borderless and seamless across the seam, and check
+     mixed HiDPI (one `contentsScale` per window is a macOS constraint; matched-DPI
+     displays work, mixed-DPI spanning does not — fix is one window per monitor, see
+     item 2 below).
+   - [ ] **De-singleton `detail::Context` and `detail::Compositor`.** For multi-device
+     support and deterministic teardown / unit testing, move the globals onto the
+     `Application`/`DeviceContext` and pass them explicitly. Not required for the
+     one-device/N-windows case, which is the current scope. (Roadmap #5.)
+   - [ ] **HiDPI / `contentsScale`.** Set `CAMetalLayer.contentsScale` from the monitor's
+     reported pixel ratio and configure surfaces at physical pixel size; keep mouse
+     coordinates in logical points. See item 2 below.
+
+2. **HiDPI / Retina rendering — designed and settled; implementation spec: `md/hidpi.md`.**
+   Root cause (verified): `attachMetalLayer()` leaves `CAMetalLayer.contentsScale` at 1.0
+   and `configureSurface()` configures the swapchain at logical point size
+   (`braid_app.cpp:47,535`) — Retina renders at 1× and AppKit upscales, hence the blur.
+   The full design — unit law, flag semantics, RGFW facts (incl. the `RGFW_scaleUpdated`
+   payload trap), step-by-step plan, TinyUI follow-up, verification protocol, fortress
+   rules — lives in **`md/hidpi.md`** (settled 2026-07-02; supersedes all earlier
+   discussion here). Decisions in brief:
+   - **Logical points in the sketch-facing API; pixels in `Surface`; `Window` is the only
+     translator** (`× pixelRatio` in exactly two places: `braid_app.cpp` surface
+     config/creation and SketchApp's projection). Existing sketches run unchanged, just
+     sharper; mouse space == draw space; exports come out at native pixels (a 1280×720
+     window on Retina saves a crisp 2560×1440 PNG).
+   - **`AppSettings::hidpi = true` by default**, per-window opt-out as a *performance*
+     hatch (2× ratio = 4× fragment work; feedback/blur already GPU-bound at 1×).
+     Opt-out shape: swapchain stays physical; only `mainSurface_` shrinks; the existing
+     size-absorbing `endFrame()` blit upscales inside Braid, never Core Animation.
+   - **pixelRatio exists only at the Window boundary** — `Surface(device, w, h)` stays
+     exact pixels (the LED-wall path); user canvases never see any window's scale.
+   - **Sampling stays Linear globally** — Nearest was tried live (2026-07-01) and
+     rejected: `feedback()`'s iterated fractional resampling degrades badly. The
+     commented-out lines remain at `braid_compositor.cpp:309-317`; chunky pixels for
+     LED/pixel-art arrive later as a per-`Surface` `Filter::Nearest` opt-in.
+   - **Mixed-DPI spanning has no layer-level fix** (one `contentsScale` per window is an
+     OS constraint) — the answer to item 1's TODO is **one borderless window per
+     physical monitor**, already supported by the `Application`/`Window` split.
 3. **Break up the single big translation unit — ✅ done 06-30.**
    `core/braid.cpp` (~1,900 lines) is gone; the implementation is now focused TUs behind
    the single public header `core/braid.h`:
@@ -104,6 +149,40 @@ ordered by the user's stated priority.
    For a creative-coding tool, iteration speed dominates. Add a minimal file watcher
    that reloads `.wgsl` files into `Shader` objects and images into `Surface::load()`
    on disk change. This is higher user value than compute/text/audio for now.
+
+8. **User-injectable custom shader passes (found 2026-07-01, reviewing `playground.cpp`).**
+   Every `Surface` effect (`blit`/`quad`/`blur`/`threshold`) is a WGSL string hardcoded
+   into `Compositor`, each with its own uniform struct, pipeline cache, and pass function
+   (`core/braid_compositor.cpp`). There is **no hook for a sketch's own fragment shader** —
+   today the only extension point is composing existing `Surface` methods inside
+   `feedback()`. A user with their own effect has to edit core to add it. **Still open** —
+   `Surface::contour()` below was landed the lightweight way (hardcoded, like blur/threshold)
+   specifically *because* this hook doesn't exist yet; it's now the reference case to
+   generalize from whenever the generic pass gets built.
+   - Fix: a generic pass, shaped like `thresholdPass`/`blurPass` but taking user WGSL —
+     fixed fullscreen-triangle vertex stage (reuse the blit's), user-supplied fragment
+     source, a small uniform buffer the sketch fills. Something like
+     `Surface::pass(Shader& customFrag, const void* uniforms, size_t size)`. Braid owns
+     pipeline/bind-group plumbing; the sketch owns the WGSL.
+   - Proof: a sketch supplies raw WGSL with no core edit and it runs through the
+     compositor.
+   - ✅ **`Surface::contour()` ported 2026-07-01** — the motivating shader
+     (`contour2.frag`, `~/Dmtr/ofworks/apps/apps2025/_shaders/2d/contour2.*`) landed as a
+     real core method rather than waiting on the hook above: samples a neighbor pattern
+     (`mode` 0-3: 8-neighbor +/X, + only, X only, 2-point) offset by `radius` px, counts how
+     many neighbors fall below a `level` luma threshold, and draws white where that count
+     crosses the pattern's cutoff — a binary isoline at the level set, genuinely different
+     from `threshold()`'s flat brightpass (which only ever feeds `bloom()`'s glow layer).
+     Same shape as `blur`/`threshold`: WGSL in `braid_compositor.cpp`
+     (`kContourWGSL`/`ContourUniforms`/`contourPass`/`contourPipelineFor`), self-transform
+     in `braid_surface.cpp`, declared in `braid.h`. New permanent example:
+     `examples/contour.cpp` (1-4 = pattern, Up/Down = level, `[`/`]` = radius), wired into
+     `chalet.yaml` and `.zed/tasks.json`. Verified: builds clean across all 13 targets;
+     ran ~3s with no Dawn validation errors (Dawn is loud about those — silence is
+     meaningful) and a window registered with the OS; user visually confirmed it renders
+     correctly (this session's screencapture is blank — terminal-only capture, a known
+     limitation of this environment, not the app). If/when the generic hook above lands,
+     this is the first candidate to move out to a user-supplied shader instead of core.
 
 ---
 
@@ -306,6 +385,10 @@ Write `braid_v0.2_surface.md` first (spec → critical-fixes → impl, the cycle
 - [ ] One-surface self-feedback; **ping-pong hidden** under the hood
 - [ ] `surface.feedback(gain, transform)` — weighted recurrence `s ← transform(s)·gain`
 - [ ] Replace (`s = s.transformed()`, the tunnel) vs accumulate (`s += …`, the trails)
+- [ ] **`Surface::trails(gain, blurRadius, tint)`** — OF-style feedback primitive:
+  snapshot, clear, redraw previous frame with decay + optional blur + tint, then draw
+  new content on top. Distinct from `feedback()` (in-place transform + accumulate);
+  this is the clean "fresh background + soft echo" look from `surfaces2026.h`.
 - [ ] Examples: invert-feedback (snake eating tail), 105% recursive zoom (tunneling)
 - **Proof:** point Braid at itself — live video-feedback tunnels/mandalas at 60fps.
 

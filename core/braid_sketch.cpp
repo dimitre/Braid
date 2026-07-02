@@ -71,7 +71,7 @@ void SketchApp::ensureReady() {
     wgpu::ShaderModuleDescriptor smd{};
     smd.nextInChain = &src;
     smd.label = "braid-default";
-    sketchModule_ = device_.CreateShaderModule(&smd);
+    sketchModule_ = device().CreateShaderModule(&smd);
 
     wgpu::BindGroupLayoutEntry e{};
     e.binding = 0;
@@ -82,12 +82,12 @@ void SketchApp::ensureReady() {
     wgpu::BindGroupLayoutDescriptor bgld{};
     bgld.entryCount = 1;
     bgld.entries = &e;
-    sketchBGL_ = device_.CreateBindGroupLayout(&bgld);
+    sketchBGL_ = device().CreateBindGroupLayout(&bgld);
 
     wgpu::PipelineLayoutDescriptor pld{};
     pld.bindGroupLayoutCount = 1;
     pld.bindGroupLayouts = &sketchBGL_;
-    sketchPL_ = device_.CreatePipelineLayout(&pld);
+    sketchPL_ = device().CreatePipelineLayout(&pld);
 
     ready_ = true;
 }
@@ -112,11 +112,11 @@ void SketchApp::background(float r, float g, float b, float a) {
     clearColor_ = {r, g, b, a};
     bgRequested_ = true;
     // Immediate clear so addons that draw into the active pass see a clean surface.
-    wgpu::CommandEncoder enc = device_.CreateCommandEncoder();
+    wgpu::CommandEncoder enc = device().CreateCommandEncoder();
     auto pass = surface().begin(enc, clearColor_);
     surface().end(pass);
     wgpu::CommandBuffer cmd = enc.Finish();
-    queue_.Submit(1, &cmd);
+    queue().Submit(1, &cmd);
 }
 void SketchApp::background(glm::vec4 c) { background(c.r, c.g, c.b, c.a); }
 void SketchApp::fill(float r, float g, float b, float a) { state_.fill = {r, g, b, a}; state_.fillEnabled = true; }
@@ -208,7 +208,7 @@ wgpu::RenderPipeline SketchApp::sketchPipeline(wgpu::TextureFormat fmt, bool lin
         lines ? wgpu::PrimitiveTopology::LineList : wgpu::PrimitiveTopology::TriangleList;
     desc.multisample.count = 1;
     desc.multisample.mask = 0xFFFFFFFF;
-    wgpu::RenderPipeline p = device_.CreateRenderPipeline(&desc);
+    wgpu::RenderPipeline p = device().CreateRenderPipeline(&desc);
     sketchPipelines_.push_back({fmt, lines, p});
     return p;
 }
@@ -224,9 +224,9 @@ void SketchApp::emitBatch() {
         wgpu::BufferDescriptor bd{};
         bd.size = vboCapacity_ * sizeof(Vertex);
         bd.usage = wgpu::BufferUsage::Vertex | wgpu::BufferUsage::CopyDst;
-        vbo_ = device_.CreateBuffer(&bd);
+        vbo_ = device().CreateBuffer(&bd);
     }
-    device_.GetQueue().WriteBuffer(vbo_, 0, batchVerts_.data(), needVerts * sizeof(Vertex));
+    device().GetQueue().WriteBuffer(vbo_, 0, batchVerts_.data(), needVerts * sizeof(Vertex));
 
     // 2) Grow + upload the uniform pool — one 256-aligned slot per draw. Growing
     //    re-creates the single bind group bound over the whole pool (offset = dynamic).
@@ -236,7 +236,7 @@ void SketchApp::emitBatch() {
         wgpu::BufferDescriptor bd{};
         bd.size = uboCapacity_ * kUniformStride;
         bd.usage = wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst;
-        ubo_ = device_.CreateBuffer(&bd);
+        ubo_ = device().CreateBuffer(&bd);
         wgpu::BindGroupEntry e{};
         e.binding = 0;
         e.buffer = ubo_;
@@ -246,14 +246,14 @@ void SketchApp::emitBatch() {
         bgd.layout = sketchBGL_;
         bgd.entryCount = 1;
         bgd.entries = &e;
-        uboBindGroup_ = device_.CreateBindGroup(&bgd);
+        uboBindGroup_ = device().CreateBindGroup(&bgd);
     }
     std::vector<uint8_t> staging(needSlots * kUniformStride, 0);
     for (size_t i = 0; i < needSlots; ++i) {
         SketchUniforms u{batchCmds_[i].mvp, batchCmds_[i].tint};
         std::memcpy(staging.data() + i * kUniformStride, &u, sizeof(u));
     }
-    device_.GetQueue().WriteBuffer(ubo_, 0, staging.data(), staging.size());
+    device().GetQueue().WriteBuffer(ubo_, 0, staging.data(), staging.size());
 
     // 3) Replay: one pass, pipeline switched only when topology changes.
     ensurePass();

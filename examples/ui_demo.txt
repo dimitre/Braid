@@ -1,0 +1,11 @@
+# Braid TinyUI demo layout — see examples/ui_demo.cpp
+# M1 is blind (no text yet): widgets are told apart by their order here.
+#   1. label   "Braid UI Demo"  (occupies a row, draws nothing yet)
+#   2. bool    enabled           checkbox
+#   3. float   radius            slider, orbit radius in pixels
+#   4. int     count             slider, number of orbiting circles
+
+label  "Braid UI Demo"
+bool   enabled   1
+float  radius    0 300 150
+int    count     1 40 12

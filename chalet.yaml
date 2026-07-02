@@ -28,6 +28,7 @@ abstracts:*:
       # - .
       - libs/macos/include
       - addons/braid-syntype
+      - addons/braid-ui
       - core
     appleFrameworks:
       - Cocoa
@@ -74,6 +75,12 @@ targets:
     files:
       include:
         - addons/braid-syntype/braid_syntype.cpp
+
+  braid-ui:
+    kind: staticLibrary
+    files:
+      include:
+        - addons/braid-ui/braid_ui.cpp
 
   hello:
     kind: executable
@@ -140,6 +147,7 @@ targets:
     settings:Cxx:
       staticLinks:
         - braid-core
+        - braid-ui
     files:
       include:
         - examples/playground.cpp
@@ -153,6 +161,16 @@ targets:
     files:
       include:
         - examples/cubes.cpp
+
+  multiwindow:
+    kind: executable
+    runWorkingDirectory: ${cwd}/bin
+    settings:Cxx:
+      staticLinks:
+        - braid-core
+    files:
+      include:
+        - examples/multiwindow.cpp
 
   bloom:
     kind: executable
@@ -171,6 +189,16 @@ targets:
     files:
       include:
         - examples/bloom.cpp
+
+  contour:
+    kind: executable
+    runWorkingDirectory: ${cwd}/bin
+    settings:Cxx:
+      staticLinks:
+        - braid-core
+    files:
+      include:
+        - examples/contour.cpp
 
   image:
     kind: executable
@@ -224,3 +252,14 @@ targets:
     files:
       include:
         - examples/syntype_audio.cpp
+
+  ui_demo:
+    kind: executable
+    runWorkingDirectory: ${cwd}/bin
+    settings:Cxx:
+      staticLinks:
+        - braid-core
+        - braid-ui
+    files:
+      include:
+        - examples/ui_demo.cpp

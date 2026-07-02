@@ -183,6 +183,18 @@ Surface& Surface::threshold(float level, float knee) {
     return *this;
 }
 
+Surface& Surface::contour(float level, float radius, int mode) {
+    if (swapchain_ || !view_) return *this;
+    ensureScratch();
+    glm::vec2 ts{1.0f / width_, 1.0f / height_};
+    wgpu::CommandEncoder enc = device_.CreateCommandEncoder();
+    detail::compositor().contourPass(enc, scratchView_, format_, view_, ts, level, radius, mode);
+    wgpu::CommandBuffer cmd = enc.Finish();
+    device_.GetQueue().Submit(1, &cmd);
+    swapScratch();
+    return *this;
+}
+
 // bloom = clone → threshold → blur → additive-composite back.
 // passes scales the blur radius (passes=5 → ~20px). Total: three render submits + one clone.
 Surface& Surface::bloom(float threshold_level, float intensity, int passes) {

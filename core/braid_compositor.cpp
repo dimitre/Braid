@@ -72,6 +72,15 @@ struct ThresholdUniforms {
     glm::vec2 _pad{};
 };
 
+struct ContourUniforms {
+    glm::vec2 texelSize;   // 1/w, 1/h
+    float level = 0.5f;    // luma threshold ("dif" in the ofworks source)
+    float radius = 1.0f;   // neighbor sample offset, in pixels ("raio")
+    int32_t mode = 0;      // 0: 8-neighbor +/X, 1: + only, 2: X only, 3: 2-point
+    float _pad0 = 0;
+    glm::vec2 _pad1{};
+};
+
 static const char* kBlitWGSL = R"WGSL(
 struct Blit {
   uvScale : vec2<f32>, uvOffset : vec2<f32>, tint : vec4<f32>,
@@ -168,6 +177,60 @@ struct VO { @builtin(position) pos : vec4<f32>, @location(0) uv : vec2<f32> };
 }
 )WGSL";
 
+// Isoline/edge detector — ported from ofworks contour2.frag. For each pixel,
+// samples a neighbor pattern (picked by `mode`, offset by `radius` texels) and
+// counts how many neighbors fall below the `level` luma threshold; draws white
+// where that count crosses the pattern's cutoff (~52.5% of its sample count) —
+// a binary contour line at the level set, unlike threshold's flat brightpass.
+// mode 0 = all 8 (+ and X), 1 = + only (4), 2 = X only (4), 3 = 2-point (+ subset).
+static const char* kContourWGSL = R"WGSL(
+struct Contour {
+  texelSize : vec2<f32>,
+  level     : f32,
+  radius    : f32,
+  mode      : i32,
+  _pad0     : f32,
+  _pad1     : vec2<f32>,
+};
+@group(0) @binding(0) var<uniform> u : Contour;
+@group(0) @binding(1) var tex : texture_2d<f32>;
+@group(0) @binding(2) var samp : sampler;
+struct VO { @builtin(position) pos : vec4<f32>, @location(0) uv : vec2<f32> };
+@vertex fn vs(@builtin(vertex_index) i : u32) -> VO {
+  var ps = array<vec2<f32>, 3>(vec2<f32>(-1.0,-1.0), vec2<f32>(3.0,-1.0), vec2<f32>(-1.0,3.0));
+  let p = ps[i];
+  var o : VO;
+  o.pos = vec4<f32>(p, 0.0, 1.0);
+  o.uv  = vec2<f32>((p.x + 1.0) * 0.5, 1.0 - (p.y + 1.0) * 0.5);
+  return o;
+}
+@fragment fn fs(in : VO) -> @location(0) vec4<f32> {
+  let offsets = array<vec2<f32>, 8>(
+    vec2<f32>(-1.0, 0.0), vec2<f32>(1.0, 0.0), vec2<f32>(0.0, 1.0), vec2<f32>(0.0, -1.0),
+    vec2<f32>(-1.0, -1.0), vec2<f32>(-1.0, 1.0), vec2<f32>(1.0, 1.0), vec2<f32>(1.0, -1.0));
+  let starts = array<i32, 4>(0, 0, 4, 0);
+  let counts = array<i32, 4>(8, 4, 4, 2);
+  let m = clamp(u.mode, 0, 3);
+  let start = starts[m];
+  let count = counts[m];
+  var c = 0.0;
+  for (var i = 0; i < count; i++) {
+    let off = offsets[start + i] * u.radius * u.texelSize;
+    // textureSampleLevel (lod=0): the loop bound comes from a uniform, but WGSL
+    // doesn't guarantee that's "uniform control flow" for textureSample — same
+    // reasoning as the blur pass above.
+    let s = textureSampleLevel(tex, samp, in.uv + off, 0.0);
+    let luma = dot(s.rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
+    if (luma < u.level) { c += 1.0; }
+  }
+  let cutoff = f32(count) * 0.525;
+  var d = 1.0;
+  if (c == 0.0) { d = 0.0; }
+  if (c >= cutoff) { d = 0.0; }
+  return vec4<f32>(d, d, d, d);
+}
+)WGSL";
+
 // Placed-quad paste: sample the full source across a quad that is scaled,
 // rotated, and positioned in NDC. Same bind layout as the blit (uniform/tex/
 // sampler) — a full-frame quad (center 0, half 1, rot 0) reproduces the source.
@@ -236,9 +299,21 @@ void Compositor::init(wgpu::Device device) {
     thrsmd.label = "braid-threshold";
     thresholdModule_ = device_.CreateShaderModule(&thrsmd);
 
+    wgpu::ShaderSourceWGSL ctrsrc{};
+    ctrsrc.code = kContourWGSL;
+    wgpu::ShaderModuleDescriptor ctrsmd{};
+    ctrsmd.nextInChain = &ctrsrc;
+    ctrsmd.label = "braid-contour";
+    contourModule_ = device_.CreateShaderModule(&ctrsmd);
+
     wgpu::SamplerDescriptor sd{};
     sd.magFilter = wgpu::FilterMode::Linear;
     sd.minFilter = wgpu::FilterMode::Linear;
+    // Nearest was tried globally (2026-07-01) and rejected: feedback()'s iterated
+    // fractional resampling degrades badly under it. If chunky pixels are wanted
+    // (LED/pixel-art), make it a per-Surface opt-in instead (roadmap item 2).
+    // sd.magFilter = wgpu::FilterMode::Nearest;
+    // sd.minFilter = wgpu::FilterMode::Nearest;
     sd.addressModeU = wgpu::AddressMode::ClampToEdge;
     sd.addressModeV = wgpu::AddressMode::ClampToEdge;
     sampler_ = device_.CreateSampler(&sd);
@@ -421,6 +496,38 @@ void Compositor::thresholdPass(wgpu::CommandEncoder& enc, wgpu::TextureView dest
     pass.End();
 }
 
+void Compositor::contourPass(wgpu::CommandEncoder& enc, wgpu::TextureView dest,
+                             wgpu::TextureFormat destFormat, wgpu::TextureView src,
+                             glm::vec2 texelSize, float level, float radius, int mode) {
+    ContourUniforms u{};
+    u.texelSize = texelSize; u.level = level; u.radius = radius; u.mode = mode;
+    wgpu::BufferDescriptor bd{};
+    bd.size = sizeof(ContourUniforms);
+    bd.usage = wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst;
+    wgpu::Buffer ub = device_.CreateBuffer(&bd);
+    device_.GetQueue().WriteBuffer(ub, 0, &u, sizeof(u));
+
+    std::array<wgpu::BindGroupEntry, 3> be{};
+    be[0].binding = 0; be[0].buffer = ub; be[0].size = sizeof(ContourUniforms);
+    be[1].binding = 1; be[1].textureView = src;
+    be[2].binding = 2; be[2].sampler = sampler_;
+    wgpu::BindGroupDescriptor bgd{};
+    bgd.layout = bgl_; bgd.entryCount = be.size(); bgd.entries = be.data();
+    wgpu::BindGroup bg = device_.CreateBindGroup(&bgd);
+
+    wgpu::RenderPassColorAttachment att{};
+    att.view = dest; att.loadOp = wgpu::LoadOp::Clear; att.storeOp = wgpu::StoreOp::Store;
+    att.clearValue = {0, 0, 0, 0};
+    wgpu::RenderPassDescriptor rpd{};
+    rpd.colorAttachmentCount = 1; rpd.colorAttachments = &att;
+
+    wgpu::RenderPassEncoder pass = enc.BeginRenderPass(&rpd);
+    pass.SetPipeline(contourPipelineFor(destFormat));
+    pass.SetBindGroup(0, bg);
+    pass.Draw(3);
+    pass.End();
+}
+
 wgpu::RenderPipeline Compositor::pipelineFor(wgpu::TextureFormat fmt, const wgpu::BlendState& blend) {
     for (auto& [f, b, p] : cache_)
         if (f == fmt && b == &blend) return p;
@@ -509,6 +616,25 @@ wgpu::RenderPipeline Compositor::thresholdPipelineFor(wgpu::TextureFormat fmt) {
     rpd.multisample.count = 1; rpd.multisample.mask = 0xFFFFFFFF;
     wgpu::RenderPipeline p = device_.CreateRenderPipeline(&rpd);
     thresholdCache_.push_back({fmt, p});
+    return p;
+}
+
+wgpu::RenderPipeline Compositor::contourPipelineFor(wgpu::TextureFormat fmt) {
+    for (auto& [f, p] : contourCache_) if (f == fmt) return p;
+    wgpu::ColorTargetState target{};
+    target.format = fmt;
+    target.writeMask = wgpu::ColorWriteMask::All;
+    wgpu::FragmentState frag{};
+    frag.module = contourModule_; frag.entryPoint = "fs";
+    frag.targetCount = 1; frag.targets = &target;
+    wgpu::RenderPipelineDescriptor rpd{};
+    rpd.layout = pl_;
+    rpd.vertex.module = contourModule_; rpd.vertex.entryPoint = "vs";
+    rpd.primitive.topology = wgpu::PrimitiveTopology::TriangleList;
+    rpd.fragment = &frag;
+    rpd.multisample.count = 1; rpd.multisample.mask = 0xFFFFFFFF;
+    wgpu::RenderPipeline p = device_.CreateRenderPipeline(&rpd);
+    contourCache_.push_back({fmt, p});
     return p;
 }
 

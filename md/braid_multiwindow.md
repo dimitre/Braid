@@ -1,6 +1,10 @@
 # Braid — Multi-window design (start-thinking)
 
-**Status:** design / research, not implemented.
+**Status:** implemented (`Application`/`Window`/`App` split, `examples/multiwindow.cpp`,
+monitor-spanning). See `braid_multiwindow_plan.md`'s "Status: implemented" section
+for the bugs found and fixed in Kimi's first pass, and §6 below for multi-monitor
+spanning. This doc otherwise still describes the design accurately — the RGFW/WebGPU
+facts below were verified directly against `libs/macos/include/RGFW.h`.
 **Prereq landed:** the TU split (roadmap #2) is done — `core/braid.cpp` is gone;
 the implementation is `braid_{timer,compositor,surface,shader,mesh,app,sketch}.cpp`
 behind the single public header `core/braid.h`. `braid_app.cpp` is the *only* TU
@@ -219,6 +223,65 @@ posture ("no public API change" for the split; keep the examples runnable).
 sketch (e.g. one running the `feedback` tunnel, one running `cubes`), both rendering
 independently at 60fps off **one shared device**. Closing one window leaves the other
 running; closing the last exits. Screenshot both → proof the shared context works.
+
+---
+
+## 6. Multi-monitor spanning — one window, several physical displays
+
+Real ask (grounded in a prior openFrameworks rig, `TheOne/src/main.cpp` +
+`ofAppGLFWWindow.h/.cpp`): one process, a normal window for control/preview, and a
+**second window that spans an arbitrary set of monitors** (e.g. indices 2,3,4,5) as
+one continuous borderless canvas — the "output" surface for an installation.
+
+**What oF does (GLFW):** `ofWindowSettings::shareContextWith` passes the first
+window's `GLFWwindow*` into `glfwCreateWindow`'s `share` param so the second
+window's GL context can see the first's textures/programs — GLFW/OpenGL contexts
+don't share by default. `fullscreenDisplays = {1,2,3}` is a list of monitor
+indices; `ofMonitors::getRectFromMonitors()` unions their rects (each monitor's
+`{x, y, width, height}` in the shared virtual-desktop space, from
+`glfwGetMonitorPos`/`glfwGetVideoMode`), and on macOS the window is simply made
+`NSWindowStyleMaskBorderless` and resized/moved to that union rect — not
+`glfwSetWindowMonitor` (that path is Windows/Linux/game-mode only).
+
+**Why Braid needs less:** there is no `shareContextWith` equivalent to build —
+every window already shares the one process-wide `wgpu::Device` unconditionally
+(§2 above). The only real gap was monitor geometry + absolute placement, and
+RGFW already has it (verified in `libs/macos/include/RGFW.h`):
+
+- `RGFW_getMonitors(&count)` → `RGFW_monitor**`, each with `.x, .y` and
+  `.mode.w, .mode.h` — the same shared-virtual-desktop-space rect data as oF's
+  `ofMonitors::rects`. The outer array is heap-allocated (`RGFW_FREE` it); the
+  `RGFW_monitor*` entries are owned by RGFW's own monitor list.
+- `RGFW_windowNoBorder` — passed to `RGFW_createWindow`, achieves a borderless
+  window on macOS via `RGFW_window_setBorder(win, 0)` right after creation
+  (`setStyleMask:NSWindowStyleMaskBorderless` — confirmed in the header, not
+  just inferred).
+- Passing explicit `x, y` to `RGFW_createWindow` (previously always `0,0` plus
+  `RGFW_windowCenter`) positions the window directly — Cocoa's
+  `initWithContentRect:` uses `win->x`/`win->y` as given when `RGFW_windowCenter`
+  isn't requested.
+
+**Design landed** (`core/braid.h` + `core/braid_app.cpp`): a `Monitors::list()` /
+`Monitors::unionOf(indices)` pair (a renamed, RGFW-backed port of `ofMonitors`),
+plus `AppSettings::position` (explicit placement) and `AppSettings::monitors`
+(span these indices as one borderless window — overrides width/height/position).
+`Window::create()` picks, in order: `monitors` (union rect, borderless) →
+`position` (explicit, no centering) → the original centered default. Secondaries
+with neither set no longer default to dead-center-on-the-primary (the overlap
+bug from the plan doc's review) — they default onto the next connected monitor.
+
+Usage, mirroring the oF example:
+```cpp
+braid::App::Settings out{};
+out.title = "output";
+out.monitors = {2, 3, 4, 5};   // union of these four screens, borderless
+app.createWindow<OutputWindow>(out);
+```
+
+Not yet verified on real hardware — the union-rect math and the borderless flag
+have only been checked by reading the code and a single/dual-monitor smoke run
+(process stays alive, registers as a foreground app, no crash). See the plan
+doc's "Follow-up work" for what a real multi-monitor pass should confirm.
 
 ---
 
