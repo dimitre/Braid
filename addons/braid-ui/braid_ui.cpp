@@ -19,8 +19,11 @@
 namespace braid {
 
 // ===========================================================================
-// fillRect — the one primitive M1 needs. Draws an axis-aligned pixel-space
-// rect into `target` with a flat color, preserving existing contents (Load).
+// fillRect — the one primitive M1 needs. Draws an axis-aligned rect into
+// `target` with a flat color, preserving existing contents (Load). Coordinates
+// arrive in widget point-space and are multiplied by `scale` (the window's
+// pixelRatio) — TinyUI's own logical→pixel projection (md/hidpi.md §8); the
+// NDC divisor stays the target's real texel size.
 // ===========================================================================
 namespace {
 
@@ -130,14 +133,14 @@ RectRenderer& rectRenderer() {
     return r;
 }
 
-void fillRect(Surface& target, glm::vec2 pos, glm::vec2 size, glm::vec4 color) {
+void fillRect(Surface& target, glm::vec2 pos, glm::vec2 size, glm::vec4 color, float scale) {
     if (!target.isValid() || size.x <= 0.0f || size.y <= 0.0f) return;
     RectRenderer& r = rectRenderer();
     r.ensure(target.device());
 
     RectUniforms u{};
-    u.posPx = pos;
-    u.sizePx = size;
+    u.posPx = pos * scale;
+    u.sizePx = size * scale;
     u.color = color;
     u.surfaceSizePx = {static_cast<float>(target.width()), static_cast<float>(target.height())};
 
@@ -222,12 +225,15 @@ public:
         ready_ = true;
     }
 
-    void draw(Surface& target, glm::ivec2 pos, const std::string& text, glm::vec4 color) {
+    void draw(Surface& target, glm::ivec2 pos, const std::string& text, glm::vec4 color,
+              float scale) {
         if (!target.isValid() || text.empty()) return;
         ensure(target.device());
 
-        std::vector<Vertex> verts = font_->buildQuads(text, static_cast<float>(pos.x),
-                                                       static_cast<float>(pos.y), color, 1.0f);
+        // Origin and glyph metrics both × scale: point-space text lands at texel
+        // positions with integer-scaled glyphs (md/hidpi.md §6).
+        std::vector<Vertex> verts = font_->buildQuads(text, static_cast<float>(pos.x) * scale,
+                                                       static_cast<float>(pos.y) * scale, color, scale);
         if (verts.empty()) return;
 
         // BitmapFont gives pixel-space positions; the UI surface is drawn in NDC.
@@ -330,8 +336,9 @@ std::vector<std::string> tokenizeLine(const std::string& line) {
 
 }  // namespace
 
-void drawText(Surface& target, glm::ivec2 pos, const std::string& text, glm::vec4 color) {
-    textRenderer().draw(target, pos, text, color);
+void drawText(Surface& target, glm::ivec2 pos, const std::string& text, glm::vec4 color,
+              float scale) {
+    textRenderer().draw(target, pos, text, color, scale);
 }
 
 // ===========================================================================
@@ -351,7 +358,7 @@ Label::Label(std::string text, glm::ivec2 pos_) {
 
 void Label::draw(Surface& s) {
     glm::vec4 c = theme ? theme->colorLabel : glm::vec4{1.0f, 1.0f, 1.0f, 1.0f};
-    drawText(s, pos, label, c);
+    drawText(s, pos, label, c, drawScale);
 }
 
 // ===========================================================================
@@ -371,13 +378,14 @@ void Checkbox::draw(Surface& s) {
     int baseline = theme ? theme->labelBaseline : 5;
 
     float box = static_cast<float>(size.y);
-    fillRect(s, glm::vec2(pos), glm::vec2(box, box), bg);
+    fillRect(s, glm::vec2(pos), glm::vec2(box, box), bg, drawScale);
     if (get()) {
         float inset = box * 0.25f;
-        fillRect(s, glm::vec2(pos) + glm::vec2(inset), glm::vec2(box - inset * 2.0f, box - inset * 2.0f), fg);
+        fillRect(s, glm::vec2(pos) + glm::vec2(inset), glm::vec2(box - inset * 2.0f, box - inset * 2.0f), fg,
+                 drawScale);
     }
     glm::vec4 labelColor = theme ? theme->colorLabel : glm::vec4{1.0f, 1.0f, 1.0f, 1.0f};
-    drawText(s, {pos.x + size.y + 8, pos.y + baseline}, label, labelColor);
+    drawText(s, {pos.x + size.y + 8, pos.y + baseline}, label, labelColor, drawScale);
 }
 
 void Checkbox::onMousePress(glm::ivec2) { set(!get()); }
@@ -403,21 +411,22 @@ void FloatSlider::draw(Surface& s) {
     int baseline = theme ? theme->labelBaseline : 5;
     glm::vec4 labelColor = theme ? theme->colorLabel : glm::vec4{1.0f, 1.0f, 1.0f, 1.0f};
 
-    fillRect(s, glm::vec2(pos), glm::vec2(size), bg);
+    fillRect(s, glm::vec2(pos), glm::vec2(size), bg, drawScale);
     // Clamp the drawn fraction, but never clamp the bound value itself here —
     // a sketch writing outside [min,max] directly should still be visible as
     // pinned-at-the-end, not silently altered.
     float t = (max > min) ? std::clamp((get() - min) / (max - min), 0.0f, 1.0f) : 0.0f;
-    fillRect(s, glm::vec2(pos), glm::vec2(static_cast<float>(size.x) * t, static_cast<float>(size.y)), fg);
+    fillRect(s, glm::vec2(pos), glm::vec2(static_cast<float>(size.x) * t, static_cast<float>(size.y)), fg,
+             drawScale);
 
     textRenderer().ensure(s.device());
-    drawText(s, {pos.x + 4, pos.y + baseline}, label, labelColor);
+    drawText(s, {pos.x + 4, pos.y + baseline}, label, labelColor, drawScale);
 
     char buf[32];
     std::snprintf(buf, sizeof(buf), "%.2f", get());
     std::string valueStr = buf;
-    int valueW = static_cast<int>(textRenderer().measure(valueStr).x);
-    drawText(s, {pos.x + size.x - 4 - valueW, pos.y + baseline}, valueStr, labelColor);
+    int valueW = static_cast<int>(textRenderer().measure(valueStr).x);  // point-space, like pos/size
+    drawText(s, {pos.x + size.x - 4 - valueW, pos.y + baseline}, valueStr, labelColor, drawScale);
 }
 
 void FloatSlider::onMouseDrag(glm::ivec2 p) {
@@ -450,16 +459,17 @@ void IntSlider::draw(Surface& s) {
     int baseline = theme ? theme->labelBaseline : 5;
     glm::vec4 labelColor = theme ? theme->colorLabel : glm::vec4{1.0f, 1.0f, 1.0f, 1.0f};
 
-    fillRect(s, glm::vec2(pos), glm::vec2(size), bg);
+    fillRect(s, glm::vec2(pos), glm::vec2(size), bg, drawScale);
     float t = (max > min) ? std::clamp(static_cast<float>(get() - min) / static_cast<float>(max - min), 0.0f, 1.0f) : 0.0f;
-    fillRect(s, glm::vec2(pos), glm::vec2(static_cast<float>(size.x) * t, static_cast<float>(size.y)), fg);
+    fillRect(s, glm::vec2(pos), glm::vec2(static_cast<float>(size.x) * t, static_cast<float>(size.y)), fg,
+             drawScale);
 
     textRenderer().ensure(s.device());
-    drawText(s, {pos.x + 4, pos.y + baseline}, label, labelColor);
+    drawText(s, {pos.x + 4, pos.y + baseline}, label, labelColor, drawScale);
 
     std::string valueStr = std::to_string(get());
-    int valueW = static_cast<int>(textRenderer().measure(valueStr).x);
-    drawText(s, {pos.x + size.x - 4 - valueW, pos.y + baseline}, valueStr, labelColor);
+    int valueW = static_cast<int>(textRenderer().measure(valueStr).x);  // point-space, like pos/size
+    drawText(s, {pos.x + size.x - 4 - valueW, pos.y + baseline}, valueStr, labelColor, drawScale);
 }
 
 void IntSlider::onMouseDrag(glm::ivec2 p) {
@@ -479,11 +489,21 @@ std::string IntSlider::toString() const { return std::to_string(get()); }
 TinyUI::TinyUI(const std::string& path) { loadLayout(path); }
 
 void TinyUI::setup(Window& w) {
-    ui_.emplace(w.device(), w.width(), w.height());
+    // Overlay at physical pixels, widget coordinates in points — fillRect/drawText's
+    // drawScale bridges them (md/hidpi.md §8). The UI stays crisp even when the
+    // sketch opts down with hidpi=false, because the overlay blits onto the
+    // always-physical swapchain.
+    drawScale_ = w.pixelRatio();
+    for (auto& el : widgets_) el->drawScale = drawScale_;
+    ui_.emplace(w.device(), w.pixelWidth(), w.pixelHeight());
     mouseSub_ = w.mouseEvents.subscribe([this](MouseEvent e) { handleMouse(e); });
-    windowSub_ = w.windowEvents.subscribe([this](WindowEvent e) {
+    windowSub_ = w.windowEvents.subscribe([this, &w](WindowEvent e) {
         if (e.type == WindowEvent::Resized && ui_) {
-            ui_->resize(static_cast<int>(e.size.x), static_cast<int>(e.size.y));
+            // Backing-scale migrations arrive as Resized too — re-query the
+            // window rather than deriving from the (point-space) payload.
+            drawScale_ = w.pixelRatio();
+            for (auto& el : widgets_) el->drawScale = drawScale_;
+            ui_->resize(w.pixelWidth(), w.pixelHeight());
         }
     });
 }
@@ -503,6 +523,7 @@ void TinyUI::insert(std::unique_ptr<Element> e) {
         return;
     }
     e->theme = &settings;
+    e->drawScale = drawScale_;
     widgets_.push_back(std::move(e));
 }
 

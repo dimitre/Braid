@@ -51,6 +51,11 @@ public:
     // (see md/ui.md §3.1), so widgets reach theming through this instead.
     const UISettings* theme = nullptr;
 
+    // Set by TinyUI alongside theme: overlay texels per point (the window's
+    // pixelRatio — md/hidpi.md §8). draw() code passes it to fillRect/drawText;
+    // pos/size and hitTest stay in logical points, matching the mouse.
+    float drawScale = 1.0f;
+
     virtual ~Element() = default;
 
     virtual void draw(Surface&) = 0;
@@ -141,8 +146,11 @@ public:
 };
 
 // Draw a bitmap-text label into a UI surface. Tint defaults to white so labels
-// can use it as-is; widgets pass their theme foreground color.
-void drawText(Surface&, glm::ivec2, const std::string&, glm::vec4 color = {1, 1, 1, 1});
+// can use it as-is; widgets pass their theme foreground color. `scale` is
+// texels per point (Element::drawScale): glyphs integer-scale with it so text
+// keeps its physical size and stays crisp on HiDPI (md/hidpi.md §6).
+void drawText(Surface&, glm::ivec2, const std::string&, glm::vec4 color = {1, 1, 1, 1},
+              float scale = 1.0f);
 
 // ---------------------------------------------------------------------------
 // TinyUI — the addon. Loads a layout file, renders every frame into its own
@@ -206,6 +214,7 @@ private:
 
     Element* active_ = nullptr;  // captured widget: press set it, drag/release target it
     Element* hover_ = nullptr;   // hit-tested on move when nothing is captured
+    float drawScale_ = 1.0f;     // window pixelRatio, mirrored into every widget's drawScale
 
     mutable std::unordered_set<std::string> warned_;  // get<T>/set<T> log-once tracking
 

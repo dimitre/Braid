@@ -3,6 +3,10 @@
 > [!CAUTION]
 > API drift. some things can change soon
 
+> [!WARNING]
+> Braid has nothing. no audio no video no input no text, 
+> The perfect tool for who needs nothing
+
 > [!TIP]
 > Run this script from the folder you want ofWorks to be installed:
 ```sh

@@ -13,6 +13,7 @@
 #include "braid_detail.h"
 
 #include <algorithm>
+#include <cmath>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -50,6 +51,31 @@ static void* attachMetalLayer(void* rgfwWindow) {
     if (!layer) return nullptr;
     RGFW_window_setLayer_OSX(win, layer);
     return layer;
+}
+
+// Authoritative backing scale (md/hidpi.md §4-5): NSWindow.backingScaleFactor,
+// falling back to the monitor's pixelRatio. Re-queried fresh on every scale
+// event — never accumulated, never taken from the RGFW_scaleUpdated payload
+// (which carries a PPI-derived value, not the backing scale).
+static float queryPixelRatio(void* rgfwWindow) {
+    auto* win = static_cast<RGFW_window*>(rgfwWindow);
+    if (id nswin = reinterpret_cast<id>(RGFW_window_getWindow_OSX(win))) {
+        using MsgF = double (*)(id, SEL);
+        double s = reinterpret_cast<MsgF>(objc_msgSend)(nswin, sel_registerName("backingScaleFactor"));
+        if (s > 0.0) return static_cast<float>(s);
+    }
+    RGFW_monitor* mon = RGFW_window_getMonitor(win);
+    return (mon && mon->pixelRatio > 0.0f) ? mon->pixelRatio : 1.0f;
+}
+
+// Dawn drives the layer's drawableSize from the surface configuration, but
+// contentsScale should still match the backing scale so CA compositing hints
+// stay honest (md/hidpi.md §4).
+static void setLayerContentsScale(void* layer, float scale) {
+    using MsgD = void (*)(id, SEL, double);
+    reinterpret_cast<MsgD>(objc_msgSend)(reinterpret_cast<id>(layer),
+                                         sel_registerName("setContentsScale:"),
+                                         static_cast<double>(scale));
 }
 
 // RGFW mouse button order (Left, Middle, Right) -> braid (Left, Right, Middle).
@@ -293,6 +319,7 @@ public:
 
         void* metalLayer = attachMetalLayer(primary_->nativeWindow());
         if (!metalLayer) return Result<void>::failure("attachMetalLayer failed");
+        primary_->adoptMetalLayer(metalLayer);
 
         auto ctx = DeviceContext::create(metalLayer, primary_->settings());
         if (!ctx) return Result<void>::failure(ctx.error);
@@ -342,6 +369,7 @@ public:
             fmt::print(stderr, "[braid] createWindow: attachMetalLayer failed\n");
             std::abort();
         }
+        w->adoptMetalLayer(layer);
         wgpu::SurfaceSourceMetalLayer metalSrc{};
         metalSrc.layer = layer;
         wgpu::SurfaceDescriptor surfDesc{};
@@ -518,6 +546,11 @@ Result<void> Window::create() {
     // renders squeezed/distorted to fit.
     settings_.width = win->w;
     settings_.height = win->h;
+    // Backing scale next: everything physical (drawable, mainSurface_) sizes off
+    // it, while settings_/mousePos_ stay in logical points (md/hidpi.md §1).
+    pixelRatio_ = queryPixelRatio(win);
+    fmt::print(stderr, "[braid] window {}x{} pt @ {:g}x -> drawable {}x{} px\n",
+               settings_.width, settings_.height, pixelRatio_, pixelWidth(), pixelHeight());
     mousePos_ = {settings_.width * 0.5f, settings_.height * 0.5f};
     RGFW_window_setExitKey(win, RGFW_keyEscape);
     RGFW_window_show(win);
@@ -543,22 +576,37 @@ void Window::closeNative() {
 
 void Window::initSurface(wgpu::Surface surface) { surface_ = std::move(surface); }
 
+void Window::adoptMetalLayer(void* layer) {
+    metalLayer_ = layer;
+    setLayerContentsScale(layer, pixelRatio_);
+}
+
+void Window::resizeSurfacesToWindow() {
+    configureSurface();
+    if (swapSurface_) swapSurface_->resize(pixelWidth(), pixelHeight());
+    if (mainSurface_) mainSurface_->resize(settings_.hidpi ? pixelWidth() : settings_.width,
+                                           settings_.hidpi ? pixelHeight() : settings_.height);
+}
+
 void Window::configureSurface() {
     wgpu::SurfaceConfiguration config{};
     config.device = device();
     config.format = settings_.format;
     config.usage = wgpu::TextureUsage::RenderAttachment;
-    config.width = static_cast<uint32_t>(settings_.width);
-    config.height = static_cast<uint32_t>(settings_.height);
+    // The drawable is always physical pixels (md/hidpi.md §2): hidpi=false only
+    // shrinks mainSurface_, so the upscale is endFrame()'s blit — never CA.
+    config.width = static_cast<uint32_t>(pixelWidth());
+    config.height = static_cast<uint32_t>(pixelHeight());
     config.presentMode = settings_.vsync ? wgpu::PresentMode::Fifo : wgpu::PresentMode::Immediate;
     config.alphaMode = wgpu::CompositeAlphaMode::Auto;
     surface_.Configure(&config);
 }
 
 void Window::createSwapAndMainSurfaces() {
-    swapSurface_.emplace(surface_, settings_.width, settings_.height, settings_.format);
-    mainSurface_.emplace(device(), settings_.width, settings_.height,
-                         wgpu::TextureFormat::RGBA16Float);
+    swapSurface_.emplace(surface_, pixelWidth(), pixelHeight(), settings_.format);
+    const int mw = settings_.hidpi ? pixelWidth() : settings_.width;
+    const int mh = settings_.hidpi ? pixelHeight() : settings_.height;
+    mainSurface_.emplace(device(), mw, mh, wgpu::TextureFormat::RGBA16Float);
     // WebGPU zero-initializes textures (alpha=0). Clear to opaque black so that
     // Surface algebra (invert, pasteSelf) and save() always see alpha=1 from frame 1.
     mainSurface_->clear({0, 0, 0, 1});
@@ -627,13 +675,27 @@ void Window::processEvent(const void* rgfwEvent) {
             break;
         }
         case RGFW_windowResized: {
-            int w = ev.update.w, h = ev.update.h;
-            settings_.width = w;
-            settings_.height = h;
-            configureSurface();
-            if (swapSurface_) swapSurface_->resize(w, h);
-            if (mainSurface_) mainSurface_->resize(w, h);
-            WindowEvent we{WindowEvent::Resized, {static_cast<float>(w), static_cast<float>(h)}};
+            settings_.width = ev.update.w;   // points — the Window API unit (md/hidpi.md §1)
+            settings_.height = ev.update.h;
+            resizeSurfacesToWindow();
+            WindowEvent we{WindowEvent::Resized,
+                           {static_cast<float>(settings_.width), static_cast<float>(settings_.height)}};
+            windowEvents.push(we);
+            windowResized(we);
+            break;
+        }
+        case RGFW_scaleUpdated: {
+            // Signal only — the payload is PPI-derived, not the backing scale
+            // (md/hidpi.md §4). Re-query the authoritative source instead.
+            float pr = queryPixelRatio(window_);
+            if (pr == pixelRatio_) break;
+            pixelRatio_ = pr;
+            if (metalLayer_) setLayerContentsScale(metalLayer_, pr);
+            resizeSurfacesToWindow();
+            // Point size is unchanged but every backing surface reallocated;
+            // sketches and addons already react to Resized, so reuse it.
+            WindowEvent we{WindowEvent::Resized,
+                           {static_cast<float>(settings_.width), static_cast<float>(settings_.height)}};
             windowEvents.push(we);
             windowResized(we);
             break;
@@ -738,6 +800,9 @@ wgpu::Queue Window::queue() const { return app_.queue(); }
 Timer& Window::timer() const { return app_.timer(); }
 int Window::width() const { return settings_.width; }
 int Window::height() const { return settings_.height; }
+float Window::pixelRatio() const { return pixelRatio_; }
+int Window::pixelWidth() const { return static_cast<int>(std::lround(settings_.width * pixelRatio_)); }
+int Window::pixelHeight() const { return static_cast<int>(std::lround(settings_.height * pixelRatio_)); }
 glm::vec2 Window::mousePos() const { return mousePos_; }
 float Window::mouseX() const { return mousePos_.x; }
 float Window::mouseY() const { return mousePos_.y; }

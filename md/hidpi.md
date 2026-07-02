@@ -1,8 +1,9 @@
 # Braid HiDPI — logical points in the API, pixels in the Surface
 
-**Status:** design, settled 2026-07-02. Next implementation step after TinyUI M1, *before*
-M2 text. Rationale: text rendering, UI hit-testing, and every future addon inherit whatever
-unit law core establishes. oF never had one law and paid for it forever; this is the fortress.
+**Status:** implemented 2026-07-02, pending §9 verification on the Retina rig (see §11
+implementation notes). Rationale: text rendering, UI hit-testing, and every future addon
+inherit whatever unit law core establishes. oF never had one law and paid for it forever;
+this is the fortress.
 
 ---
 
@@ -181,3 +182,25 @@ already supports: composite the same canvas into each window instead of spanning
    it; the point-space API is identical either way.
 5. **User Surfaces are sacred pixels.** Nothing in `Window`'s scale plumbing may touch
    `Surface(device, w, h)` dimensions — that's the LED path, and it stays exact.
+
+## 11. Implementation notes (2026-07-02, landed — all targets build)
+
+- **Step 10 turned out to be a no-op.** SketchApp's ortho was already built from logical
+  `settings_` and NDC maps onto the full pixel drawable, so point-space drawing fills the
+  pixel-sized `mainSurface_` with zero changes to `braid_sketch.cpp`. Rule 2's "two known
+  places" are therefore `braid_app.cpp` and TinyUI's own projection (below).
+- **Core:** `queryPixelRatio()` (NSWindow `backingScaleFactor` via msgSend, monitor
+  fallback) + `setLayerContentsScale()` live next to `attachMetalLayer()`;
+  `Window::adoptMetalLayer()` stores the layer and applies the hint; `configureSurface()`
+  and `swapSurface_` are always physical; `mainSurface_` obeys `AppSettings::hidpi`;
+  `resizeSurfacesToWindow()` is shared by `RGFW_windowResized` and the new
+  `RGFW_scaleUpdated` case (which re-queries, ignores the payload, and reuses the
+  Resized event exactly as §5.8 planned).
+- **Physical accessors:** `pixelRatio()`, `pixelWidth()`, `pixelHeight()` (Processing's
+  pixelWidth naming).
+- **TinyUI:** overlay `Surface` at `pixelWidth()×pixelHeight()`; widgets keep point-space
+  `pos`/`size`/hitTest and carry `Element::drawScale` (set alongside `theme`), which
+  `fillRect`/`drawText` multiply through — `BitmapFont::buildQuads` already took a scale,
+  so M2 text integer-scales for free. `measure()` stays point-space, keeping value-text
+  right-alignment correct.
+- M2 text landed before HiDPI in practice (parallel session); both are in and build clean.
