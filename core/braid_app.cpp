@@ -131,7 +131,7 @@ static char printableChar(RGFW_key v) {
     return (v >= 32 && v < 127) ? static_cast<char>(v) : 0;
 }
 
-// RGFW is a process-wide singleton (see braid_multiwindow.md §1): init is safe
+// RGFW is a process-wide singleton (see multiwindow.md §1): init is safe
 // to call more than once as long as every call is idempotent. Application::
 // ensureInitialized() is the "real" owner (it pairs this with RGFW_deinit()),
 // but Monitors::list() must also work *before* any window exists — e.g. to

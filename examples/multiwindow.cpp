@@ -23,11 +23,11 @@ constexpr int kFallbackScale = 3;   // output window size when {1,2} aren't conn
 struct BigScene {
     braid::Surface canvas;
     explicit BigScene(wgpu::Device device) : canvas(device, kCanvasWidth, kCanvasHeight) {
-        canvas.clear({0, 0, 0, 1});
+        canvas.clear({1, 1, 1, 1});
     }
 
     void step() {
-        canvas.feedback(0.97f, [](braid::Surface& s) {
+        canvas.feedback(1.0f, [](braid::Surface& s) {
             s.zoom(1.03f);
             s.rotate(0.010f);
         });
@@ -49,7 +49,7 @@ public:
     void draw() override {
         if (!scene) return;
         background(0.0f, 0.0f, 0.0f);
-        surface().compositeFrom(scene->canvas);
+        surface().compositeFrom(scene->canvas, braid::Blend::Alpha, {1.0f, 0.0f, 0.0f, 1.0f});
 
         if (frameCount() % 15 == 0) {
             char buf[64];
@@ -68,8 +68,8 @@ public:
 
     void draw() override {
         if (!scene) return;
-        background(1.0f, 0.0f, 0.0f);
-        surface().compositeFrom(scene->canvas);
+        background(0.0f, 0.0f, 0.0f);
+        surface().compositeFrom(scene->canvas, braid::Blend::Alpha, {0.0f, 1.0f, 0.0f, 1.0f});
     }
 };
 

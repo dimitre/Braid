@@ -18,9 +18,7 @@ ordered by the user's stated priority.
    That is now split into `Application` (shared device + global loop) and `Window`
    (per-window RGFW window + swapchain + surfaces + hooks), with `App` kept as the
    backward-compatible primary window. Historical design details live in
-   `dev/braid_multiwindow.md`; implementation blow-by-blow lives in
-   `dev/braid_multiwindow_plan.md`. This roadmap item tracks what is decided and what
-   comes next.
+   `dev/multiwindow.md`. This roadmap item tracks what is decided and what comes next.
 
    **Done.**
    - ✅ `Application`/`Window`/`App` split, one shared `wgpu::Device`, global loop with

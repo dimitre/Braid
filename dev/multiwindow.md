@@ -1,10 +1,10 @@
-# Braid — Multi-window design (start-thinking)
+# Multi-window support in Braid
 
 **Status:** implemented (`Application`/`Window`/`App` split, `examples/multiwindow.cpp`,
-monitor-spanning). See `braid_multiwindow_plan.md`'s "Status: implemented" section
-for the bugs found and fixed in Kimi's first pass, and §6 below for multi-monitor
-spanning. This doc otherwise still describes the design accurately — the RGFW/WebGPU
-facts below were verified directly against `libs/macos/include/RGFW.h`.
+monitor-spanning). The "Status: implemented" section below records the bugs found
+and fixed in Kimi's first pass; §5 covers multi-monitor spanning. This doc is both
+the design rationale and the historical implementation record. The RGFW/WebGPU
+facts were verified directly against `libs/macos/include/RGFW.h`.
 **Prereq landed:** the TU split (roadmap #2) is done — `core/braid.cpp` is gone;
 the implementation is `braid_{timer,compositor,surface,shader,mesh,app,sketch}.cpp`
 behind the single public header `core/braid.h`. `braid_app.cpp` is the *only* TU
@@ -268,7 +268,7 @@ plus `AppSettings::position` (explicit placement) and `AppSettings::monitors`
 `Window::create()` picks, in order: `monitors` (union rect, borderless) →
 `position` (explicit, no centering) → the original centered default. Secondaries
 with neither set no longer default to dead-center-on-the-primary (the overlap
-bug from the plan doc's review) — they default onto the next connected monitor.
+bug from the implementation review) — they default onto the next connected monitor.
 
 Usage, mirroring the oF example:
 ```cpp
@@ -285,13 +285,278 @@ doc's "Follow-up work" for what a real multi-monitor pass should confirm.
 
 ---
 
+## 7. DisplayWindow — the dumb output window
+
+The current `createWindow<T>()` path creates a **secondary sketch window**: a full
+`Window`/`SketchApp` with its own `setup/update/draw/exit` hooks, persistent
+offscreen `Surface`, and input channels. That is overkill for the common rig where
+one window is the controller and every other window is just a fullscreen display
+for a `Surface` the controller produces.
+
+**Design goal:** a `DisplayWindow` has no app on it. It is a slave container whose
+only job is to present a `Surface` fullscreen (or windowed). The primary
+`SketchApp` does all the drawing and decides what to show.
+
+### Public API
+
+```cpp
+class MySketch : public braid::SketchApp {
+    braid::DisplayWindow* display = nullptr;
+public:
+    using braid::SketchApp::SketchApp;
+
+    void setup() override {
+        braid::App::Settings s{};
+        s.title = "output";
+        s.monitors = {1, 2};        // span external monitors, borderless
+        s.vsync = false;            // display only; primary paces the app
+        display = &createDisplayWindow(s);
+    }
+
+    void draw() override {
+        background(0);
+        fill(1.0f, 0.0f, 0.0f);
+        circle(width() * 0.5f, height() * 0.5f, 100.0f);
+
+        if (display) display->show(surface());
+    }
+};
+```
+
+`DisplayWindow` exposes only what a display needs:
+
+```cpp
+class DisplayWindow {
+public:
+    void show(const Surface& src);   // blit src to this window's swapchain
+    void close();                    // close just this display
+    // no setup/update/draw/exit, no surface(), no input channels
+};
+```
+
+### Why a separate type, not a `Window` subclass
+
+`Window` is a *sketch* abstraction: it owns a persistent `Surface`, virtual hooks,
+and event channels. A `DisplayWindow` does none of that. Making it inherit from
+`Window` would saddle it with a misleading interface (`draw()`, `surface()`,
+`keyEvents`, etc.) and dead virtual hooks. Braid's primitive is `Surface`; the
+window types are just different containers for presenting it.
+
+### Internal structure: composition, no inheritance
+
+```
+public:
+  Window        — sketch window (persistent Surface + hooks + events)
+  DisplayWindow — dumb output (swapchain only)
+
+internal:
+  NativeWindow  — RGFW window + wgpu::Surface + swapchain config + present
+  Window contains        NativeWindow
+  DisplayWindow contains NativeWindow
+```
+
+`NativeWindow` is an internal helper, not a public base class. It owns everything
+that is genuinely common between the two window kinds. `Window` adds the sketch
+layer (persistent `mainSurface_`, batch state, hooks, channels). `DisplayWindow`
+adds only `show(Surface&)`.
+
+### Application changes
+
+`Application` already owns:
+
+```cpp
+Window* primary_;
+std::vector<std::unique_ptr<Window>> secondaries_;
+```
+
+It gains:
+
+```cpp
+std::vector<std::unique_ptr<DisplayWindow>> displays_;
+```
+
+Event routing needs to map an `RGFW_window*` to whichever wrapper owns it:
+
+```cpp
+std::unordered_map<RGFW_window*, Window*> windowMap_;
+std::unordered_map<RGFW_window*, DisplayWindow*> displayMap_;
+```
+
+A display window receives OS events but ignores input; the only event it cares
+about is the close button, and the intended behavior is slave-like.
+
+### Lifecycle / slave behavior
+
+- **Primary closes** → close all secondaries and all displays, then exit.
+- **Display close (title-bar click)** → ignored by default. The display is a
+  slave; its lifetime is tied to the primary.
+- **Secondary sketch window close** → unchanged from today, but this path is kept
+  only for compatibility; `createDisplayWindow()` becomes the recommended way to
+  spawn outputs.
+
+### Relationship to `createWindow<T>()`
+
+Keep `createWindow<T>()` for secondary sketch windows (option A), but do not
+promote it. It remains for the rare case where a secondary genuinely needs its
+own `draw()` hook and input. The multiwindow example should be updated to use
+`createDisplayWindow()` as the canonical pattern, with a note that
+`createWindow<T>()` still exists for advanced cases.
+
+### Open questions before implementation
+
+1. **Should `DisplayWindow::show()` happen automatically or explicitly?**
+   Explicit (`display->show(surface())`) is more flexible — the primary can show
+   the main surface, an offscreen layer, or nothing. Automatic mirroring is
+   simpler but magic.
+2. **Should a display window's close button do anything?** Default to no-op
+   (slave); optionally propagate to primary as a convenience.
+3. **Should `DisplayWindow` support addons/overlays?** Probably not initially;
+   overlays belong on the primary's `Surface` if needed.
+
+---
+
+## Status: implemented (Kimi's pass + follow-up fixes)
+
+Kimi landed the `Application`/`Window`/`App` split described above, including the
+`RGFW_window* → Window*` map (the design's own fallback for event routing, used
+unconditionally rather than relying on `RGFW_window_checkQueuedEvent`'s internal
+per-window scan). A review pass on top found three real bugs, fixed below —
+plus the multi-monitor spanning feature this doc didn't originally scope.
+
+### RGFW-level fix: windows always-on-top
+
+Independent of the bugs below: `libs/macos/include/RGFW.h`'s
+`RGFW_window_raise()` (called by `Window::create()` for every window) passed
+`kCGNormalWindowLevelKey` to Cocoa's `-setLevel:`. That constant is a
+`CGWindowLevelKey` lookup-table *index* (value 4), not a real `CGWindowLevel` —
+the real "normal" level is `kCGNormalWindowLevel` (0). Every Braid window has
+therefore been opening one level above normal, i.e. always-on-top over other
+apps. Same root cause in `RGFW_window_setFloating`/`RGFW_window_isFloating`.
+Fixed by using the real level constants (`kCGNormalWindowLevel`,
+`kCGStatusWindowLevel`) directly — matches a fix the user filed upstream with
+RGFW's maintainer (`@ColleagueRiley`) the same day, found independently via
+their own `openFrameworks`-on-RGFW fork.
+
+### Bugs found and fixed
+
+1. **Closing the primary killed every window, contradicting the milestone's own
+   demo comment** ("press Q to close just this window" on the *primary*, which
+   actually ended the whole app). `Application::run()` special-cased
+   `primary_->shouldClose()` as a hard `running_ = false`, ignoring open
+   secondaries. Fixed: any window (primary or secondary) can now close
+   independently; the app only exits once none are left. Since the primary's
+   `Window` object is caller-owned (usually the `App` on `main()`'s stack, not
+   heap-owned by `Application` the way secondaries are), it can't be erased from
+   a vector — instead `Window::closeNative()` (new) releases its RGFW window and
+   GPU surfaces immediately and a `primaryClosed_` flag tells the loop to stop
+   touching it, without destroying the C++ object.
+2. **Primary-window surfaces were destroyed after the device**, contradicting
+   this doc's own constraint #2 ("device outlives surfaces"). Because `App`'s
+   `Application` is a *derived-class* member while the surfaces live on the
+   *base* `Window`, plain C++ destruction order tears down `app_` (device
+   included) before the base class's `swapSurface_`/`mainSurface_` — backwards
+   for the primary specifically (secondaries were already fine, since
+   `secondaries_.clear()` runs before `ctx_.reset()`). Fixed by having
+   `Window::closeNative()` explicitly release surfaces up front, called from
+   `App::~App()` before its `app_` member is destroyed.
+3. **Per-window `targetFps` was dead code.** Frame pacing is one shared
+   `Timer` owned by `Application`, seeded once from the *primary's*
+   `AppSettings::targetFps` — a secondary's value is never read. The demo set
+   `sideSettings.targetFps = 0` as if it did something; removed, and
+   `AppSettings::targetFps` now says so explicitly. Per-window `vsync` *is*
+   real (each window configures its own swapchain presentMode).
+4. **Two windows spawned overlapping.** `Window::create()` always passed
+   `RGFW_windowCenter` with hardcoded `(0,0)`, so every window — primary and
+   secondary alike — centered on the same monitor. Fixed as part of the
+   monitor-spanning work below: secondaries with no explicit placement now
+   default onto the next connected monitor (centered on it, at their own size),
+   falling back to a cascade offset on single-monitor rigs.
+
+### Multi-monitor spanning (new capability, not in the original doc)
+
+Requirement: one process, N windows sharing the one device (already free — see
+§2 above), where a window can be positioned on an arbitrary monitor or made to
+**span several monitors as one borderless canvas** — the pattern used by
+`ofAppGLFWWindow`'s `fullscreenDisplays` + `shareContextWith` in openFrameworks
+(see e.g. `TheOne/src/main.cpp`). Braid needs no context-sharing equivalent
+(one `wgpu::Device` for every window, unconditionally); the only real gap was
+monitor geometry + placement, which RGFW already exposes:
+
+- `RGFW_getMonitors(&count)` — array of `RGFW_monitor*`, each with `.x, .y,
+  .mode.w, .mode.h` in the shared virtual-desktop coordinate space (same data
+  as oF's `ofMonitors::rects`).
+- `RGFW_windowNoBorder` — borderless window flag (`NSWindowStyleMaskBorderless`
+  on macOS, applied via `RGFW_window_setBorder` right after creation).
+- `RGFW_window_move`/`RGFW_window_resize` and passing explicit `x,y` to
+  `RGFW_createWindow` — absolute placement (previously unused; every window
+  hardcoded `(0,0)` + center).
+
+Added to `core/braid.h`:
+```cpp
+struct MonitorRect { int x, y, width, height; };
+namespace Monitors {
+    std::vector<MonitorRect> list();               // enumerate, RGFW order
+    MonitorRect unionOf(std::span<const int> indices);  // bounding rect
+}
+```
+and two new `AppSettings` fields:
+```cpp
+std::optional<glm::ivec2> position;  // explicit top-left; unset = auto-placed
+std::vector<int> monitors;           // span these monitor indices as one
+                                      // borderless window (e.g. {2,3,4,5})
+```
+`Window::create()` honors `monitors` (union rect + borderless, overrides
+width/height/position) over `position` (explicit, no centering) over the
+original default (centered). Implemented in `core/braid_app.cpp`
+(`Monitors::list/unionOf`, `Window::create`).
+
+### Verification
+
+- `chalet build` succeeds for braid-core and every example target (`hello`,
+  `sketch`, `feedback`, `feed`, `playground`, `cubes`, `multiwindow`, `bloom`,
+  `image`) — no regressions.
+- `multiwindow` launches, registers as a foreground app, and stays alive
+  without crashing (checked via process state + `lsappinfo`, since this
+  session's `screencapture` returns a blank image regardless of which app is
+  frontmost — a permission gap in this environment, not a code issue).
+- **Manually confirmed by the user (single-monitor machine, 2026-07-01):**
+  the two windows spawn offset (not stacked); pressing `q` on the primary
+  closes only the primary and the secondary keeps running; closing the
+  secondary then exits the process cleanly. Matches the fixed behavior above.
+  **Still unverified: real spanning across several physical monitors**
+  (e.g. indices 2-5) — needs a multi-display rig.
+
+---
+
+## Follow-up work
+
+Future multi-window work is now tracked in `md/braid_roadmap.md` §1 (Multi-window
+support). The live items are:
+
+- Dumb output window / `DisplayWindow` abstraction — design written up in
+  §7 above. Implementation adds a public `DisplayWindow`
+  type created via `createDisplayWindow()`, an internal `NativeWindow` helper
+  shared by composition with `Window`, and slave-lifecycle behavior (primary
+  close closes all displays; display close is a no-op).
+- Physical multi-monitor spanning test.
+- De-singleton `detail::Context` and `detail::Compositor`.
+- HiDPI / `CAMetalLayer.contentsScale`.
+- One global frame pace / target FPS for the whole app (documented decision).
+
+---
+
 ## TL;DR
 - **RGFW:** multi-window works; init/deinit are global (do them once), and events go
   through one shared queue you must drain per-window after a single `RGFW_pollEvents()`.
   Each window gets its own `CAMetalLayer` → its own `wgpu::Surface`.
 - **WebGPU:** "share context" = **one `Device` for all windows**; there is no
   per-window context. Per-window is just a surface + swapchain.
-- **Braid:** the blocker isn't the shared device (the current singletons already model
-  that correctly) — it's that `App` fuses library-init + device + window + loop.
-  Split *application lifetime* from *window lifetime*, keep the device shared, and
-  keep `App` as the first window so no example breaks. End in `examples/multiwindow.cpp`.
+- **Braid:** split *application lifetime* from *window lifetime*, keep the device
+  shared, and keep `App` as the first window so no example breaks.
+- **DisplayWindow:** a separate, sketch-less output container for the common
+  control-window + fullscreen-display rig. `Window` and `DisplayWindow` share an
+  internal `NativeWindow` helper by composition; the public types are independent.
+  Secondary sketch windows via `createWindow<T>()` stay available but are no longer
+  the default multi-window pattern.
+- **Status:** implemented 2026-07-01. Three real bugs were fixed in review; see
+  "Status: implemented" above.
