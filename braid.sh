@@ -4,12 +4,13 @@ set -e
 
 git pull
 
-# Run libs.sh and capture CHALET_PATH output
-CHALET_PATH=$(./libs/libs.sh | grep "^CHALET_PATH=" | cut -d= -f2 || true)
+# Run libs.sh visibly (don't swallow its stdout)
+./libs/libs.sh
 
 # Add chalet to PATH if found
+CHALET_PATH=$(command -v chalet || true)
 if [[ -n "$CHALET_PATH" ]]; then
-    export PATH="$CHALET_PATH:$PATH"
+    export PATH="$(dirname "$CHALET_PATH"):$PATH"
 fi
 
 chalet buildrun --only-required feed
