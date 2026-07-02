@@ -13,13 +13,13 @@ Fresh read of `README.md`, `core/braid.h`, `core/braid.cpp`, `core/braid_image.c
 `chalet.yaml`, and the examples. These are the items that surfaced as live concerns,
 ordered by the user's stated priority.
 
-1. **Multi-window support — implemented; future: output-window simplification.**
+- `[multiwindow]` **Multi-window support — implemented; future: output-window simplification.**
    The original blocker was that `App` fused library-init + device + window + loop.
    That is now split into `Application` (shared device + global loop) and `Window`
    (per-window RGFW window + swapchain + surfaces + hooks), with `App` kept as the
    backward-compatible primary window. Historical design details live in
-   `md/braid_multiwindow.md`; implementation blow-by-blow lives in
-   `md/braid_multiwindow_plan.md`. This roadmap item tracks what is decided and what
+   `dev/braid_multiwindow.md`; implementation blow-by-blow lives in
+   `dev/braid_multiwindow_plan.md`. This roadmap item tracks what is decided and what
    comes next.
 
    **Done.**
@@ -70,22 +70,22 @@ ordered by the user's stated priority.
      the output window is genuinely borderless and seamless across the seam, and check
      mixed HiDPI (one `contentsScale` per window is a macOS constraint; matched-DPI
      displays work, mixed-DPI spanning does not — fix is one window per monitor, see
-     item 2 below).
+     `[hidpi]` below).
    - [ ] **De-singleton `detail::Context` and `detail::Compositor`.** For multi-device
      support and deterministic teardown / unit testing, move the globals onto the
      `Application`/`DeviceContext` and pass them explicitly. Not required for the
-     one-device/N-windows case, which is the current scope. (Roadmap #5.)
+     one-device/N-windows case, which is the current scope. (See `[global-state]` below.)
    - [ ] **HiDPI / `contentsScale`.** Set `CAMetalLayer.contentsScale` from the monitor's
      reported pixel ratio and configure surfaces at physical pixel size; keep mouse
-     coordinates in logical points. See item 2 below.
+     coordinates in logical points. See `[hidpi]` below.
 
-2. **HiDPI / Retina rendering — designed and settled; implementation spec: `md/hidpi.md`.**
+- `[hidpi]` **HiDPI / Retina rendering — designed and settled; implementation spec: `dev/hidpi.md`.**
    Root cause (verified): `attachMetalLayer()` leaves `CAMetalLayer.contentsScale` at 1.0
    and `configureSurface()` configures the swapchain at logical point size
    (`braid_app.cpp:47,535`) — Retina renders at 1× and AppKit upscales, hence the blur.
    The full design — unit law, flag semantics, RGFW facts (incl. the `RGFW_scaleUpdated`
    payload trap), step-by-step plan, TinyUI follow-up, verification protocol, fortress
-   rules — lives in **`md/hidpi.md`** (settled 2026-07-02; supersedes all earlier
+   rules — lives in **`dev/hidpi.md`** (settled 2026-07-02; supersedes all earlier
    discussion here). Decisions in brief:
    - **Logical points in the sketch-facing API; pixels in `Surface`; `Window` is the only
      translator** (`× pixelRatio` in exactly two places: `braid_app.cpp` surface
@@ -103,9 +103,26 @@ ordered by the user's stated priority.
      commented-out lines remain at `braid_compositor.cpp:309-317`; chunky pixels for
      LED/pixel-art arrive later as a per-`Surface` `Filter::Nearest` opt-in.
    - **Mixed-DPI spanning has no layer-level fix** (one `contentsScale` per window is an
-     OS constraint) — the answer to item 1's TODO is **one borderless window per
+     OS constraint) — the answer to `[multiwindow]`'s TODO is **one borderless window per
      physical monitor**, already supported by the `Application`/`Window` split.
-3. **Break up the single big translation unit — ✅ done 06-30.**
+- `[transform]` **Placed-quad / point-space gap (found 2026-07-02, verifying HiDPI) — design
+   brainstorm: `dev/transform.md`.**
+   `Surface::paste`/`pasteSelf` bypass the sketch-facing point-space transform stack
+   entirely (`braid_sketch.cpp`'s `pushMatrix`/`translate`/`rotate`/`scale` →
+   `proj_ * view_ * transform_.current`, used by every vertex primitive) — they
+   hand-compute NDC from raw pixel `center`/`size`/`rot` (`makeQuadUniforms`,
+   `braid_surface.cpp:229`), with zero connection to that stack. Surfaced as a real bug:
+   `examples/feed.cpp` passed `width()`/`height()` (SketchApp's *point* space, per
+   `dev/hidpi.md`) into `pasteSelf`, which needs *pixel* space
+   (`surface().width()/height()`) — on Retina (2×) the pasted quad landed at half the
+   correct size/position. Patched locally (`examples/feed.cpp:48-52`, plus the stale
+   "like SketchApp 2D" comment on `Surface::paste` in `braid.h`), but that's a second
+   place to remember, not a structural close. Full brainstorm — root cause, two options
+   (a thin point-space `Transform` type with one correct conversion point, vs. unifying
+   placed-paste into the real vertex/MVP pipeline so `pushMatrix`/`rotate`/`scale`
+   compose with it for free) — lives in **`dev/transform.md`**. **Not decided yet** —
+   pick a direction before more examples/addons reach for `paste`/`pasteSelf`.
+- `[tu-split]` **Break up the single big translation unit — ✅ done 06-30.**
    `core/braid.cpp` (~1,900 lines) is gone; the implementation is now focused TUs behind
    the single public header `core/braid.h`:
    - `braid_timer.cpp` (Timer — pure CPU, headless-testable)
@@ -125,32 +142,32 @@ ordered by the user's stated priority.
      validation errors). No public API change. (`braid_result.cpp`/`braid_channel.cpp`
      were unneeded — Result/Channel are header-only templates.)
 
-4. **Correct the README/marketing about "single-file-ish."**
+- `[readme]` **Correct the README/marketing about "single-file-ish."**
    The README says "small, single-file-ish." This is not a virtue, and it is not
    accurate (`core/braid.cpp` is ~1,900 lines, plus `braid_image.cpp`, plus headers).
    Replace with honest framing: **single public header (`#include "braid.h"`) with a
    modular implementation.** The header is the contract; the implementation can be
    many files. Don't celebrate monolithic source.
 
-5. **Audit and reduce global state.**
+- `[global-state]` **Audit and reduce global state.**
    Related to multi-window: `detail::g_ctx` and `detail::g_compositor` are global.
    Even for single-window, this makes unit testing and deterministic cleanup harder.
    Move toward explicit ownership: `App` (or a new `DeviceContext`) holds the
    `Context`, and Surfaces borrow it on construction. This enables both multi-window
    and a future non-GPU test harness.
 
-6. **Add non-GPU tests before the refactor grows.**
+- `[tests]` **Add non-GPU tests before the refactor grows.**
    The public API has testable seams: `Result<T>`, `Channel<T>`, `Timer`, `remap()`,
    `Mesh` CPU generators. Add a small test target (even a single `tests/braid_test.cpp`)
    that exercises these without touching Dawn/RGFW. Run it in CI. This pays off
    especially once the TU split lands.
 
-7. **Shader hot-reload / asset watcher (creative-loop priority).**
+- `[hot-reload]` **Shader hot-reload / asset watcher (creative-loop priority).**
    For a creative-coding tool, iteration speed dominates. Add a minimal file watcher
    that reloads `.wgsl` files into `Shader` objects and images into `Surface::load()`
    on disk change. This is higher user value than compute/text/audio for now.
 
-8. **User-injectable custom shader passes (found 2026-07-01, reviewing `playground.cpp`).**
+- `[custom-shaders]` **User-injectable custom shader passes (found 2026-07-01, reviewing `playground.cpp`).**
    Every `Surface` effect (`blit`/`quad`/`blur`/`threshold`) is a WGSL string hardcoded
    into `Compositor`, each with its own uniform struct, pipeline cache, and pass function
    (`core/braid_compositor.cpp`). There is **no hook for a sketch's own fragment shader** —
@@ -192,19 +209,19 @@ geometry). The ordering is by **convergence** (where independent sessions agree)
 **urgency** (which item gets more expensive every day). Several older docs predate the
 Surface/algebra/feedback/image work, which is now done — these are what's left and live.
 
-1. **`braid::Key` enum + keycode mapping at the pump** — *do first.* Cited by three docs
+- `[keycodes]` **`braid::Key` enum + keycode mapping at the pump** — *do first.* Cited by three docs
    (dependency-concerns makes it the #1 RGFW mitigation; v0.1.1; unmapped #8 builds on it).
    The only item whose cost **grows every session**: `KeyEvent.key` exposed the raw RGFW
    code, and new sketches (`feed`, `feedback`, `image`) already compare raw chars. Own the
    joint before more sketches weld to RGFW.  *(in progress)*
-2. **SketchApp batching** — ✅ done 06-29. Primitives now defer: each appends geometry +
+- `[batching]` **SketchApp batching** — ✅ done 06-29. Primitives now defer: each appends geometry +
    a `DrawCmd`; at flush the frame uploads in **two writes** (one growing vertex buffer +
    one 256-aligned uniform pool addressed by **dynamic offset**, single bind group) and
    replays as draws, switching pipeline only on topology change. A frame of N shapes
    allocates **nothing** in steady state (was: a buffer + bind group *per primitive*).
    Needed a dedicated SketchApp pipeline (explicit layout w/ `hasDynamicOffset`, since
    `Shader::getPipeline` uses auto-layout). `cubes.cpp` (~400 boxes/frame) runs clean.
-3. **Depth + always-lit default shader → solid `box`/`sphere`** — finishes v0.2.3's "sketch
+- `[depth-lighting]` **Depth + always-lit default shader → solid `box`/`sphere`** — finishes v0.2.3's "sketch
    tier complete". Two docs agree: `Surface` needs an optional depth attachment (correctness
    blocker for filled 3D), then the default shader goes always-lit (geometry-roadmap option
    3: one directional light + ambient; 2D shapes get `normal=(0,0,1)`), which unlocks solids.
@@ -264,14 +281,14 @@ handlers, fire outside the lock) · clear the `braid.cpp` Metal `[VERIFY]` tag.
 ---
 
 ## North stars (the why, so the tasks don't drift)
-1. **Surface is the one primitive.** You can only draw via a Surface; the screen is
-   just the Surface you show. (Collapses Screen / image / video-out / feedback.)
-2. **Two tiers, one vocabulary.** Fallible things (load, compile) return `Result<T>`.
-   Expressive things (Surface algebra) are **total** — never error.
-3. **Model the artist's mind, not the GPU's hazard.** Expose the ouroboros, hide the
-   ping-pong. One knob (gain), not two buffers.
-4. **Beautiful enough to just exist.** `surface += surface.transformed()` should
-   compile and do the obvious thing. Define the algebra so guards are unnecessary.
+- **Surface is the one primitive.** You can only draw via a Surface; the screen is
+  just the Surface you show. (Collapses Screen / image / video-out / feedback.)
+- **Two tiers, one vocabulary.** Fallible things (load, compile) return `Result<T>`.
+  Expressive things (Surface algebra) are **total** — never error.
+- **Model the artist's mind, not the GPU's hazard.** Expose the ouroboros, hide the
+  ping-pong. One knob (gain), not two buffers.
+- **Beautiful enough to just exist.** `surface += surface.transformed()` should
+  compile and do the obvious thing. Define the algebra so guards are unnecessary.
 
 ---
 
@@ -295,14 +312,14 @@ Surface never reaches back. So:
 | **addons** | image · audio · video · MIDI · text/fonts | *peripherals* — plug into the core, optional by **dependency weight** |
 
 **Principles:**
-1. **The core is *exactly* Surface + algebra + the loop. Everything else is an addon.**
-   (Not "everything is an addon" — that hollows out the identity, the oF mistake. Strength
-   is a small strong core + optional peripherals; the discipline is what you *refuse* to add.)
-2. **Modularize by dependency weight, not feature category.** image earns a compiled
-   module (mango + 7 codec libs) → `braid-image`, optional by simply not linking it.
-   3D primitives have *zero* deps → a header in core, never a module. Don't ceremony the
-   cheap stuff.
-3. **WebGPU is already the abstraction — don't wrap it.** The only realistic "swaps" are
+- **The core is *exactly* Surface + algebra + the loop. Everything else is an addon.**
+  (Not "everything is an addon" — that hollows out the identity, the oF mistake. Strength
+  is a small strong core + optional peripherals; the discipline is what you *refuse* to add.)
+- **Modularize by dependency weight, not feature category.** image earns a compiled
+  module (mango + 7 codec libs) → `braid-image`, optional by simply not linking it.
+  3D primitives have *zero* deps → a header in core, never a module. Don't ceremony the
+  cheap stuff.
+- **WebGPU is already the abstraction — don't wrap it.** The only realistic "swaps" are
    other WebGPU impls (wgpu-native, browser under Emscripten), same API shape. A GPU-API
    layer over WebGPU is an abstraction over an abstraction: large tax, tiny win. Keep the
    *platform* specifics behind seams (window lib, Dawn-vs-wgpu, Metal glue) — that's where
@@ -313,6 +330,17 @@ load/save) ✅ done v0.3.0b · later `braid-audio`, `braid-video`, `braid-midi`,
 — each a chalet target you link only when you need it. braid-image is the template the rest
 copy: declare the public entry points in `braid.h`, define them in the addon TU, reach core
 internals through `braid_detail.h`, list the heavy archives only on the consuming target.
+
+**Addon manifests + braidGen (new, from `md/braid_addons.md` review).** The current
+`chalet.yaml` copy-pastes the 7-archive mango block into every image-consuming target and
+leaks addon `includeDirs` into the global abstract. Move to per-addon manifests
+(`addon.yml`) declaring sources, staticLinks, frameworks, defines, and frame hooks;
+generate `chalet.yaml`, `compile_flags.txt`, and `.zed/` config from a `braidGen` tool
+modeled on ofWorks' `ofGen`. Lock the schema by retrofitting the three real addons
+(`braid-image`, `braid-syntype`, `braid-ui`), then automate. This keeps the user-facing
+"one-line addon" promise honest and removes build ceremony. The project itself should be an
+addon-shaped manifest so nested projects work at any depth via a discovered `.braidroot`
+marker (no `../../..` counting).
 
 **Bumper sticker:** *Surface is the heart; everything that flows into or out of a Surface
 is an addon; WebGPU is what the heart is made of.*
@@ -340,8 +368,8 @@ So this milestone is minor polish, done whenever.
       No sketch sees an RGFW code → windowing stays a swappable joint. Examples migrated.
 - [ ] **Harden the Metal surface** — clear the `braid.cpp:909 [VERIFY]` tag once confirmed
       across resize + HiDPI; it's the platform code with the least margin *(review 06-29)*
-- [ ] **HiDPI / content-scale** — moved to the top of Immediate (2026-06-30), see item 2
-      there for the confirmed root cause and fix.
+- [ ] **HiDPI / content-scale** — moved to the top of Immediate (2026-06-30), see
+      `[hidpi]` there for the confirmed root cause and fix.
 - [ ] **Channel reentrancy** — callbacks fire under `cbMtx_` during `pop()`; a callback that
       (un)subscribes would deadlock. Snapshot handlers then fire outside the lock, or
       document the constraint *(review 06-29)*

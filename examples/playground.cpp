@@ -61,8 +61,8 @@ int main() {
     s.title = "Braid — playground";
     s.width = 900;
     s.height = 900;
-    s.width = 2000;
-    s.height = 1200;
+    // s.width = 2000;
+    // s.height = 1200;
     Playground app(s);
     return app.run() ? 0 : 1;
 }

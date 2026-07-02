@@ -1,0 +1,12 @@
+[
+	{
+		"context": "Terminal || Workspace", // || EmptyPane || SharedScreen
+		"bindings": {
+			// Cmd+Shift+R — build & run the playground (your canvas).
+			"cmd-shift-r": ["task::Spawn", { "task_name": "▶️ Run (playground)" }],
+			// matches the ofWorks template binding as well
+			"ctrl-cmd-right": ["task::Spawn", { "task_name": "▶️ Run (playground)" }],
+			"ctrl-shift-b": "workspace::ToggleLeftDock"
+		}
+	}
+]

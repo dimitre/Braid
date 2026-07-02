@@ -360,8 +360,11 @@ public:
 
     // === Placed paste (grab the frame, paste it back as a transformed quad) ===
     // Draw `src` onto an arbitrary quad of this Surface. center & size are in
-    // pixels (top-left origin, like SketchApp 2D); rotation is radians about the
-    // quad center. Unlike compositeFrom (always fullscreen), the quad can be
+    // this Surface's own pixels (top-left origin) — use surface().width()/height(),
+    // NOT SketchApp's point-space width()/height() (dev/hidpi.md §1: Surface always
+    // speaks pixels, even though SketchApp's 2D draw calls are in points and go
+    // through the ortho projection instead). rotation is radians about the quad
+    // center. Unlike compositeFrom (always fullscreen), the quad can be
     // smaller / rotated / scaled, so the source lands as a discrete shard.
     Surface& paste(const Surface& src, glm::vec2 center, glm::vec2 size, float rotation = 0.0f,
                    const wgpu::BlendState& blend = Blend::Alpha, glm::vec4 tint = {1, 1, 1, 1},

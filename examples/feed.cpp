@@ -43,10 +43,13 @@ public:
         // Grab the frame, paste it back as one rotated/scaled shard over itself,
         // inverted, at full power. Blend::None ⇒ the quad replaces inside; the
         // uncovered corners keep older shards. No fade — the negative feeds itself.
-        surface().pasteSelf({width() * 0.5f, height() * 0.5f},
-                            {width() * scale, height() * scale},
-                            rot, braid::Blend::None,
-                            {1.0f, 1.0f, 1.0f, 1.0f}, invert_);
+        // pasteSelf's center/size are pixel-space (Surface's own unit, dev/hidpi.md
+        // §1) — use surface().width()/height(), not the point-space width()/height().
+        braid::Surface& s = surface();
+        s.pasteSelf({s.width() * 0.5f, s.height() * 0.5f},
+                    {s.width() * scale, s.height() * scale},
+                    rot, braid::Blend::None,
+                    {1.0f, 1.0f, 1.0f, 1.0f}, invert_);
 
         if (frameCount() % 15 == 0) {
             char buf[64];

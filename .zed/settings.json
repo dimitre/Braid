@@ -1,0 +1,34 @@
+// Braid — folder-specific Zed settings (mirrors the ofWorks template, adapted).
+{
+	"file_scan_exclusions": ["build/**", "**/*.tga"],
+	"search": {
+		"exclude": {
+			"build/**": true
+		}
+	},
+	"diagnostics": {
+		"include_warnings": true
+	},
+	"lsp": {
+		"clangd": {
+			"binary": {
+				"arguments": ["--background-index", "--header-insertion=never"]
+			}
+		}
+	},
+	"languages": {
+		"C++": {
+			// Braid uses hard tabs, width 4 (matches the ofWorks base).
+			"hard_tabs": true,
+			"tab_size": 4,
+			"enable_language_server": true,
+			"use_autoclose": true,
+			"extend_comment_on_newline": true,
+			"remove_trailing_whitespace_on_save": true,
+			"ensure_final_newline_on_save": true,
+			// format_on_save left off: no .clang-format in the repo yet, so clangd would
+			// reformat to LLVM style. Add a .clang-format and flip this to "on" if wanted.
+			"format_on_save": "off"
+		}
+	}
+}

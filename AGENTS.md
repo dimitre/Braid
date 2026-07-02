@@ -4,6 +4,12 @@ Braid is a WebGPU creative-coding framework for macOS. This file is the fast pat
 for an agent (or a human) to write, build, and run a Braid sketch. Everything below
 is real API from `braid.h` and the `examples/` — copy it.
 
+## Git
+
+**Do not touch git.** No `git add`, `git rm`, `git commit`, `git push`, or any other git
+command — the user manages git themselves. Edit files and leave the working tree/index as
+you found it.
+
 ## The one idea
 
 **A `Surface` is the only thing you draw into.** The screen is just the Surface you
